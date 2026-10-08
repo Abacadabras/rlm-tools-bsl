@@ -2,6 +2,7 @@ from __future__ import annotations
 import bisect
 import collections
 import concurrent.futures
+import functools
 import inspect
 import json
 import logging
@@ -132,6 +133,7 @@ logger = logging.getLogger(__name__)
 from rlm_tools_bsl.bsl_xml_parsers import (
     CATEGORY_TO_REF_HEAD as _CATEGORY_TO_REF_HEAD,
     _normalize_category,
+    cf_form_event_scope,
     parse_metadata_xml,
     parse_event_subscription_xml,
     parse_scheduled_job_xml,
@@ -525,6 +527,40 @@ _FIND_PATH_NODE_LIMIT = 200
 def _is_literal_pattern(pattern: str) -> bool:
     """True when *pattern* contains no regex metacharacters (treat as literal)."""
     return not any(c in _RE_METACHARS for c in pattern)
+
+
+# v1.43.0: счёт литерала без учёта регистра обязан совпадать с `re.IGNORECASE` — им литерал считался
+# до релиза, им же считает `regex=True`, — а `str.lower()` + `in` заметно дешевле движка regex.
+# Расходятся они только на символах ТЕКСТА, которые `re` сворачивает с символом шаблона, а `lower()` —
+# нет: `ı`/`İ` у `i`, `ſ` у `s`, финальная сигма, исторические варианты кириллицы (`ᲂ` — узкое «о»,
+# U+1C82) у `в д о с т ъ`. Файл с таким символом считается движком regex, прочие — быстрой веткой.
+# Набор символов берётся у самого `re`, а не из таблицы, которая разошлась бы с версией Python.
+_CI_CASED_CHARS: tuple[str, ...] = ()
+
+
+def _ci_cased_chars() -> tuple[str, ...]:
+    """Символы с регистровой парой (кандидаты свёртки `re.IGNORECASE`) и U+0307 — хвост строчной `İ`."""
+    global _CI_CASED_CHARS
+    if not _CI_CASED_CHARS:
+        cased = tuple(c for c in map(chr, range(0x110000)) if c.lower() != c or c.upper() != c)
+        _CI_CASED_CHARS = cased + ("\u0307",)
+    return _CI_CASED_CHARS
+
+
+@functools.lru_cache(maxsize=4096)
+def _ci_divergent_text_chars(ch: str) -> frozenset[str]:
+    """Символы текста, на которых `ch.lower() in t.lower()` расходится с `re.IGNORECASE`, и символы со
+    строчной из нескольких знаков, в которую входит строчная `ch` (`İ` → `i` + U+0307 сдвигает позиции)."""
+    rx = re.compile(re.escape(ch), re.IGNORECASE)
+    low = ch.lower()
+    out = {
+        t
+        for t in _ci_cased_chars()
+        if (low in t.lower()) != bool(rx.search(t)) or (len(t.lower()) > 1 and low in t.lower())
+    }
+    if low in ("σ", "ς"):
+        out.add("Σ")  # строчная `Σ` зависит от соседей: в конце слова `lower()` даёт `ς`
+    return frozenset(out)
 
 
 class LazyList:
@@ -995,7 +1031,8 @@ def _parse_print_commands(body: str, path: str) -> tuple[list[dict], list[str]]:
             row = _row(name, None, "not_set", None)
         events.append((m.start(), row))
 
-    # 3. Делегирование всего списка — хелпер туда не ходит, но называет, КУДА не ходил.
+    # 3. Делегирование всего списка — разборщик туда не ходит, а называет вызовы (раскрывает их
+    #    find_print_forms, v1.43.0).
     delegates = [re.sub(r"\s+", "", m.group("recv")) + m.group("meth") for m in _PF_LIST_DELEGATE_RE.finditer(code)]
 
     rows: list[dict] = []
@@ -1005,6 +1042,80 @@ def _parse_print_commands(body: str, path: str) -> tuple[list[dict], list[str]]:
             seen.add(row["name"])
             rows.append(row)
     return rows, delegates
+
+
+# Делегирование ВСЕГО списка раскрывается не глубже этого числа переходов: на боевых ERP
+# цепочка «менеджер → общий модуль локализации → менеджер другого документа» — 2.
+_PF_DELEGATE_MAX_DEPTH = 3
+
+
+def _pf_list_delegate_calls(body: str) -> tuple[str, list[dict]]:
+    """``(параметр-список процедуры, вызовы делегирования)`` — те же маски, что у
+    ``_parse_print_commands``. Вызов: ``{expr, receiver: [сегменты], method, list_arg}``,
+    ``list_arg`` — первый аргумент как написан (по маске с содержимым строк)."""
+    lines = body.splitlines()
+    code = _PF_DIRECTIVE_RE.sub(lambda m: " " * len(m.group(0)), "\n".join(mask_comments_and_strings(lines)))
+    text = "\n".join(mask_comments_and_strings(lines, keep_string_content=True))
+    pm = _PF_PARAM_RE.search(code)
+    coll = pm.group(1) if pm else "КомандыПечати"
+    calls = []
+    for m in _PF_LIST_DELEGATE_RE.finditer(code):
+        receiver = [s for s in re.sub(r"\s+", "", m.group("recv")).split(".") if s]
+        args = _pf_call_args(text, m.end())
+        calls.append(
+            {
+                "expr": ".".join(receiver) + "." + m.group("meth"),
+                "receiver": receiver,
+                "method": m.group("meth"),
+                "list_arg": args[0].strip() if args else "",
+            }
+        )
+    return coll, calls
+
+
+# Делегаты, которые пишут набор движений по ИМЕНИ регистра из аргумента (v1.43.0):
+# (модуль, метод) в нижнем регистре → индекс аргумента (с нуля) с именем регистра.
+# Таблица, а не общее правило «процедура пишет Движения[<параметр>]»: среди таких процедур
+# есть очистка (УдалитьДвиженияДокумента — Движения[Имя].Очистить()), и общее правило дало
+# бы ложные движения. Каждая запись — с замером:
+#   БГУ: ПроведениеСервер.ОтразитьДвиженияПоРегистру(ДополнительныеСвойства, Движения, Отказ, ИмяТаблицы)
+#        — тело: Движения[ИмяТаблицы].Записывать = Истина; …Загрузить(…); 184 вызова в 60 модулях
+#        объектов документов. В ERP (ПроведениеДокументов.ОтразитьДвижения) из модулей объектов
+#        документов не вызывается — записи нет.
+_REGISTER_BY_NAME_DELEGATES: dict[tuple[str, str], int] = {
+    ("проведениесервер", "отразитьдвиженияпорегистру"): 3,
+}
+_REGISTER_BY_NAME_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)\s*\(", re.IGNORECASE)
+
+
+def _register_by_name_refs(body: str) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """``(литеральные (имя, строка), вычисляемые (выражение, строка))`` вызовов делегатов
+    ``_REGISTER_BY_NAME_DELEGATES``. Две маски одной длины (приём ``_parse_print_commands``):
+    вызов ищется по коду без комментариев и строк, аргументы читаются с содержимым строк —
+    имя регистра лежит в литерале. Аргумент может быть перенесён и отделён комментарием."""
+    literal: list[tuple[str, int]] = []
+    dynamic: list[tuple[str, int]] = []
+    # Дешёвый префильтр по сырому тексту: маска всего модуля стоит десятки миллисекунд, а
+    # функцию зовут на каждом find_register_movements — у 99 % документов делегата нет.
+    low = body.casefold()
+    if not any(method in low for _module, method in _REGISTER_BY_NAME_DELEGATES):
+        return literal, dynamic
+    lines = body.splitlines()
+    code = "\n".join(mask_comments_and_strings(lines))
+    text = "\n".join(mask_comments_and_strings(lines, keep_string_content=True))
+    for m in _REGISTER_BY_NAME_CALL_RE.finditer(code):
+        pos = _REGISTER_BY_NAME_DELEGATES.get((m.group(1).casefold(), m.group(2).casefold()))
+        if pos is None:
+            continue
+        line_no = code.count("\n", 0, m.start()) + 1
+        args = _pf_call_args(text, m.end())
+        arg = args[pos].strip() if len(args) > pos else ""
+        lit = _PF_ID_LITERAL_RE.fullmatch(arg)
+        if lit and re.fullmatch(r"\w+", lit.group(1)):
+            literal.append((lit.group(1), line_no))
+        else:
+            dynamic.append((arg[:80] or f"{m.group(1)}.{m.group(2)}", line_no))
+    return literal, dynamic
 
 
 # ---------------------------------------------------------------------------
@@ -2725,15 +2836,34 @@ def make_bsl_helpers(
         когда после приоритета остаётся >1 кандидата одного (верхнего) ранга — выбор
         всё равно детерминирован (первый по стабильной сортировке пути). Имя без
         кандидатов → ``(arg, {... candidates: []})``: трактуем ``arg`` как литеральный
-        путь (обратная совместимость — поведение как у прежнего bad-path)."""
-        if _looks_like_path(arg):
+        путь (обратная совместимость — поведение как у прежнего bad-path).
+
+        v1.43.0: префикс типа (``Документ.X``) — категория, кандидаты других категорий
+        отбрасываются ДО ранжирования (раньше на омониме отвечал объект любой категории).
+        Типизированное имя проверяется раньше «похоже на путь»: суффикс ``.xml``/``.bsl``
+        делал путём и ``'Документ.XML'`` (объект с техническим именем ``XML``)."""
+        typed_cat, _typed_bare = _split_typed_name(arg) if isinstance(arg, str) else ("", "")
+        is_typed_name = bool(typed_cat) and "/" not in arg and "\\" not in arg
+        if not is_typed_name and _looks_like_path(arg):
             return arg, {"resolved_from_name": False}
         _ensure_index()
         # Снять префикс типа (``Документ.X`` → ``X``) перед exact-сканом — как в
         # get_object_modules; иначе ``Документ.X`` не матчит bare object_name и уходит
         # битым путём. Оригинал (arg) сохраняется у вызывающих для error/_meta-текста.
-        a_lower = _strip_meta_prefix(arg).lower()
+        want_cat, bare = _split_object_arg(arg)
+        a_lower = _strip_meta_prefix(bare).lower()
         cands = [(rel, info) for rel, info in _index_state if info.object_name and info.object_name.lower() == a_lower]
+        if want_cat:
+            in_category = [(rel, info) for rel, info in cands if (info.category or "").lower() == want_cat.lower()]
+            if cands and not in_category:
+                # Объект с таким именем есть, но в ДРУГИХ категориях: прежде аргумент уходил в чтение
+                # «файла» `Отчет.X` и падал ошибкой файловой системы — причину называем сами.
+                found = ", ".join(sorted({info.category or "" for _rel, info in cands}))
+                raise ValueError(
+                    f"Объект {_strip_meta_prefix(bare)!r} в категории {want_cat} не найден (модули есть в: "
+                    f"{found}). Передайте путь модуля или имя с верным префиксом типа."
+                )
+            cands = in_category
         if not cands:
             return arg, {
                 "resolved_from_name": True,
@@ -3112,6 +3242,9 @@ def make_bsl_helpers(
         return _project_public_rows(results)
 
     _proc_lazy = LazyDict()
+    # Пути, разобранные, когда карту перехватов индекса прочитать не удалось: их `overridden_by`
+    # дописывается при следующем вызове `extract_procedures` (v1.43.0).
+    _procs_without_overrides: set[str] = set()
     _prefilter_lazy = LazyDict()
 
     def _parse_procedures(path: str) -> list[dict]:
@@ -3224,7 +3357,8 @@ def make_bsl_helpers(
         live regex parser finds a procedure NOT present in the index (typically
         a multi-line signature that older indexes missed), it is appended to
         the result with the same shape, including ``overridden_by`` enrichment
-        from ``idx_reader.get_overrides_for_path``. This makes the helper
+        from the index override map (``_index_overrides_for_path`` — v1.43.0: по
+        идентичности модуля, а не по ``source_path``). This makes the helper
         self-healing — multi-line procedures appear immediately, without
         requiring ``rlm-bsl-index index update``.
 
@@ -3250,9 +3384,13 @@ def make_bsl_helpers(
             overrides_map: dict | None = None
             if idx_reader is not None:
                 try:
-                    overrides_map = idx_reader.get_overrides_for_path(path)
+                    # v1.43.0: карта по ИДЕНТИЧНОСТИ модуля (путь модуля в расширении), а не
+                    # по source_path — сборщик прилеплял перехват к чужому модулю.
+                    overrides_map = _index_overrides_for_path(path)
                 except Exception:
-                    overrides_map = None
+                    overrides_map = {}
+                if overrides_map is None:
+                    _procs_without_overrides.add(path)
 
             result: list[dict] | None = None
             if idx_reader is not None:
@@ -3284,7 +3422,19 @@ def make_bsl_helpers(
                 result.extend(additions)
             return result
 
-        return _proc_lazy.get_or_set(path, _extract_with_index)
+        retry_overrides = path in _procs_without_overrides  # до разбора: не перечитывать в том же вызове
+        procedures = _proc_lazy.get_or_set(path, _extract_with_index)
+        if retry_overrides:
+            # Разбор закеширован в окне сбоя чтения перехватов: без этого шага ответ без
+            # `overridden_by` жил бы до конца сессии. Карта перечитывается; удалось — дописываем.
+            try:
+                overrides_map = _index_overrides_for_path(path)
+            except Exception:
+                overrides_map = None
+            if overrides_map is not None:
+                _procs_without_overrides.discard(path)
+                _attach_overrides(procedures, overrides_map)
+        return procedures
 
     def find_exports(path: str) -> list[dict]:
         """Return only exported procedures/functions from a BSL file.
@@ -3302,7 +3452,7 @@ def make_bsl_helpers(
         file_types: str = "bsl",
         path: str = "",
         regex: bool = False,
-        ignore_case: bool = False,
+        ignore_case: bool = True,
         top: int = 20,
         group_by: str = "category",
     ) -> dict:
@@ -3321,7 +3471,8 @@ def make_bsl_helpers(
         Args:
             pattern: подстрока (по умолчанию) либо Python-regex при ``regex=True``.
             file_types: список расширений через запятую (``'bsl'``, ``'bsl,xml'``);
-                пусто — все известные индексу расширения.
+                пусто — как ``'bsl'``. Расширение вне ``.bsl/.mdo/.xml`` (``rights``,
+                ``form``, ``dcs``) перечисляется обходом файлов (v1.43.0; раньше — ложный ноль).
             path: относительное поддерево (``'CommonModules'``); пусто — весь
                 текущий корень. Санитайзер тот же, что у ``git_search``.
             top: размер страницы ``top`` — файлы с наибольшим числом совпадений.
@@ -3337,6 +3488,11 @@ def make_bsl_helpers(
         ``safe_grep`` соседние CFE видит, поэтому ``count_matches`` считает их так
         же и говорит об этом машинно: молчаливое current-root-only было бы новой
         ложной полнотой.
+
+        **v1.43.0.** ``source`` — по фактическому маршруту перечисления: ``index`` (только
+        навигационный индекс), ``live`` (только обход файлов / живой каталог), ``index+live``
+        (смешанный набор расширений файлов либо сессия основной конфигурации с соседними
+        расширениями — их модули перечисляются живьём).
         """
         # Guard ПЕРВЫМ действием — как на обоих входах grep. C-движок `_sre`
         # повиснет на (a+)+b, а таймаут песочницы его не прерывает.
@@ -3364,6 +3520,19 @@ def make_bsl_helpers(
             f".{e.strip().lstrip('.').lower()}" for e in (file_types or "").split(",") if e.strip().lstrip(".")
         )
 
+        # v1.43.0: умолчание следует языку — 1С регистронезависима. Литерал без учёта регистра
+        # считается как `re.IGNORECASE`: быстрой веткой `lower()` + `in`, а файл с символом, который
+        # `re` сворачивает иначе, чем `lower()` (`_ci_divergent_text_chars`), — движком regex.
+        # Строчная шаблона — посимвольно: у строки финальная сигма в `lower()` зависит от соседей.
+        literal_ci = ignore_case and not regex
+        needle = ""
+        ci_divergent: frozenset[str] = frozenset()
+        if literal_ci:
+            needle = "".join(ch.lower() for ch in pattern)
+            if len(needle) == len(pattern):
+                ci_divergent = frozenset().union(*map(_ci_divergent_text_chars, set(pattern)))
+            else:
+                literal_ci = False  # строчная `İ` — два знака: позиции не совпадут, считает regex
         try:
             flags = re.IGNORECASE if ignore_case else 0
             compiled = re.compile(pattern if regex else re.escape(pattern), flags)
@@ -3374,16 +3543,34 @@ def make_bsl_helpers(
         # При ридере фильтр по расширению уходит в SQL (таблица file_paths);
         # иначе перечисляется живой BSL-каталог плюс, при небазовых расширениях,
         # обход ФС.
-        # Перечисление идёт ШТАТНЫМ `glob_files`: при подключённом ридере паттерн
-        # `**/*.ext` — поддержанная индексная стратегия, то есть фильтр по
-        # расширению уходит в SQL (`WHERE extension = ?`); без ридера тот же вызов
-        # обходит ФС. Своего канала к `file_paths` здесь не заводится.
+        # При ридере маска `**/*.ext` — поддержанная индексная стратегия (фильтр по расширению
+        # уходит в SQL); без ридера перечисление идёт штатным `glob_files` — обходом ФС.
+        # v1.43.0: маршрут каждой маски — ФАКТИЧЕСКИЙ. Ридер отдаёт `None`, когда ответить не может
+        # (расширение вне навигационного индекса, нет таблицы `file_paths`, окно пересборки), и та же
+        # маска идёт обходом файлов — это живая часть ответа, а не индексная.
         indexed = idx_reader is not None and not _optional_index_is_foreign()
         source = "index" if indexed else "live"
         candidates: list[str] = []
+        index_enum = live_enum = False
+        index_files: set[str] = set()  # кандидаты, которые отдал навигационный индекс
         for ext in exts or (".bsl",):
+            mask = f"**/*{ext}"
             try:
-                candidates.extend(glob_files_fn(f"**/*{ext}"))
+                rows = None
+                if indexed:
+                    try:
+                        rows = idx_reader.glob_files(mask)
+                    except Exception:
+                        rows = None
+                if rows is not None:
+                    index_enum = True
+                    index_files.update(r.replace("\\", "/") for r in rows)
+                else:
+                    # FS-канал текущего корня; без него — штатный `glob_files` (ридер снова отдаст
+                    # `None`, и сработает тот же обход ФС).
+                    rows = (glob_files_fs_fn if callable(glob_files_fs_fn) else glob_files_fn)(mask)
+                    live_enum = True
+                candidates.extend(r for r in rows if not r.startswith("[hint:"))
             except Exception:
                 continue
         candidates = [c.replace("\\", "/") for c in candidates]
@@ -3427,6 +3614,17 @@ def make_bsl_helpers(
             candidates = candidates[:_COUNT_MATCHES_SCAN_MAX]
             truncated = True
 
+        # v1.43.0: происхождение — по файлам, которые попали в счёт (после фильтра `path` и потолка
+        # перечисления), а не по наличию ридера: индексная часть — файлы навигационного индекса, живая —
+        # маски, которые ридер не отдал (их перечислил обход ФС), и модули соседних расширений. Живая
+        # часть, отброшенная фильтром пути, ответ «смешанным» не делает; пустая область — маршрут масок.
+        if indexed and source == "index":  # ветка «кандидатов нет → BSL-каталог» уже поставила "live"
+            index_part = any(c in index_files for c in candidates)
+            live_part = any(c not in index_files for c in candidates)
+            if not candidates:
+                index_part, live_part = index_enum, live_enum
+            source = ("index+live" if live_part else "index") if index_part else "live"
+
         counts: dict[str, int] = {}
         failed_files = 0
         scanned = 0
@@ -3435,6 +3633,10 @@ def make_bsl_helpers(
         # --- git fast path ---------------------------------------------------
         # Зеркало safe_grep: литеральный паттерн И исходники под git → один вызов
         # `git grep -c` вместо пула Python-грепов; агрегация на сервере.
+        # v1.43.0: счёт без учёта регистра — ТОЛЬКО Python-веткой: git -i паритета с lower()
+        # не даёт ни для кириллицы (системный regex с учётом локали, под службой с локалью C
+        # свёртки нет), ни для ASCII-шаблона (свёртка идёт и по тексту: "İ".lower() содержит
+        # "i"). Условие git-ветки прежнее — `not ignore_case` в нём уже есть.
         py_paths = list(candidates)
         if candidates and not regex and not ignore_case and _is_literal_pattern(pattern) and _git_search_available():
             base_paths = [c for c in candidates if c not in _extension_paths_set]
@@ -3462,6 +3664,8 @@ def make_bsl_helpers(
             # ОДИНАКОВЫЕ числа на литеральном паттерне. Вторая строка с тем же
             # совпадением — это второе совпадение; два совпадения в одной строке —
             # одно.
+            if literal_ci and not any(ch in text for ch in ci_divergent):
+                return rel, sum(1 for line in text.lower().splitlines() if needle in line), 0
             return rel, sum(1 for line in text.splitlines() if compiled.search(line)), 0
 
         if py_paths:
@@ -4234,63 +4438,233 @@ def make_bsl_helpers(
             # недоказанное.
         return out
 
-    def _read_procedure_one(
-        path: str, proc_name: str, include_overrides: bool = False, numbered: bool = False
-    ) -> str | None:
-        """Scalar core of read_procedure (single proc_name). See read_procedure."""
-        procedures = extract_procedures(path)
-        target = None
-        for p in procedures:
-            if p["name"].lower() == proc_name.lower():
-                target = p
-                break
-        if target is None:
+    # ── v1.43.0: перехваты модуля по ИДЕНТИЧНОСТИ, а не по source_path ──────────
+    #
+    # Сборщик связывает строку перехвата с модулем основной конфигурации сначала по
+    # совпадению пути, а когда его нет (модуля в основной нет ЛИБО раскладки путей разные,
+    # CF против EDT) — по имени объекта и типу модуля БЕЗ категории и формы. Перехват модуля
+    # объекта справочника прилипал к одноимённому документу, перехват формы — к первой
+    # форме объекта, а правильный модуль строку не получал вовсе. Путь модуля В РАСШИРЕНИИ
+    # верен всегда, поэтому чтение сверяет строку с модулем по идентичности из него.
+
+    def _norm_module_path(path: str) -> str:
+        # Обратная косая черта — разделитель ТОЛЬКО на Windows; на POSIX это символ имени
+        # (правило v1.37.0), и слепая замена создала бы несуществующий путь.
+        return path.replace("\\", "/") if os.name == "nt" else path
+
+    # Модули уровня конфигурации (сеанса, приложения, внешнего соединения): объекта у них нет,
+    # и ключ — одно имя файла (такой модуль в конфигурации один).
+    _CONFIG_LEVEL_MODULE_FILES = frozenset(
+        {
+            "managedapplicationmodule.bsl",
+            "ordinaryapplicationmodule.bsl",
+            "sessionmodule.bsl",
+            "externalconnectionmodule.bsl",
+        }
+    )
+
+    def _canonical_module_key(rel: str) -> tuple[str, ...]:
+        """Идентичность модуля — его путь БЕЗ элементов раскладки выгрузки, в нижнем регистре.
+
+        Конфигуратор кладёт модуль в каталог ``Ext`` (``X/Ext/ObjectModule.bsl``), модуль формы —
+        в ``Ext/Form/Module.bsl``, модули уровня конфигурации — в корневой ``Ext``; EDT пишет без
+        ``Ext`` (``X/ObjectModule.bsl``, ``Forms/Ф/Module.bsl``), а модули уровня конфигурации —
+        в ``Configuration/``. После снятия этих элементов ключ одинаков у обеих раскладок, а всё
+        остальное — категория, объект, форма, команда, таблица внешнего источника, любая
+        категория вне словаря — остаётся в ключе (поэтому модули с одинаковыми объектом и типом,
+        но разными таблицами или командами, не совпадают).
+
+        Элемент раскладки судится по ПОЛОЖЕНИЮ, а не по имени: объект, форма, команда, общий
+        модуль бывают названы ``Ext``/``Form``/``Configuration`` (EDT ``Catalogs/Ext/ObjectModule.bsl``
+        — модуль объекта ``Ext``). Каталоги выгрузки чередуются «коллекция/имя»
+        (``Catalogs/X/Forms/Ф``), поэтому у EDT каталогов над файлом модуля ЧЁТНОЕ число;
+        Конфигуратор добавляет к ним ``Ext`` (нечётное) либо ``Ext/Form`` у формы (снова чётное,
+        но на месте ``Ext`` у EDT стоит коллекция, а коллекции ``Ext`` в выгрузке нет); модуль
+        уровня конфигурации EDT — единственный каталог ``Configuration``. Путь — от корня своей
+        конфигурации (так его отдают и ``_main_module_rel``, и строки перехватов)."""
+        parts = [p for p in _norm_module_path(rel or "").split("/") if p and p != "."]
+        dirs = [p.casefold() for p in parts[:-1]]
+        if len(dirs) % 2 == 1 and dirs[-1] == "ext":
+            del dirs[-1]
+        elif len(dirs) >= 2 and len(dirs) % 2 == 0 and dirs[-2:] == ["ext", "form"]:
+            del dirs[-2:]
+        elif dirs == ["configuration"]:
+            dirs = []
+        return tuple(dirs + [p.casefold() for p in parts[-1:]])
+
+    def _identity_is_proven(ident: tuple[str, ...]) -> bool:
+        """Ключ указывает на ОДИН модуль: путь из каталога и файла либо модуль уровня конфигурации."""
+        return len(ident) >= 2 or (len(ident) == 1 and ident[0] in _CONFIG_LEVEL_MODULE_FILES)
+
+    def _module_identity(path: str) -> tuple[str, ...] | None:
+        """Идентичность модуля ОСНОВНОЙ конфигурации — в форме ``_override_row_identity``."""
+        ident = _canonical_module_key(path)
+        return ident if _identity_is_proven(ident) else None
+
+    def _group_overrides_by_target(pairs) -> dict[str, list[dict]]:
+        """``{target_method: [строки]}`` из пар ``(имя цели, строка)`` БЕЗ учёта регистра имени цели:
+        1С регистронезависима, и ``&Перед("ПриЗаписи")`` с ``&После("ПРИЗАПИСИ")`` — два перехвата
+        ОДНОГО метода. Ключ — первое написание; потребители сворачивают ключи через ``lower()``, и
+        при двух ключах один список затёр бы другой."""
+        out: dict[str, list[dict]] = {}
+        spelling: dict[str, str] = {}
+        for target, row in pairs:
+            key = spelling.setdefault((target or "").lower(), target or "")
+            out.setdefault(key, []).append(row)
+        return out
+
+    _index_override_cache: dict[str, dict] = {}
+
+    def _index_override_map() -> dict[tuple[str, ...], dict[str, list[dict]]] | None:
+        """{идентичность модуля: {target_method: [строки]}} по ВСЕМ строкам индекса, один раз на сессию;
+        ``None`` — таблицу прочитать не удалось.
+
+        Не по ``source_path``: сборщик связывает строку с модулем основной конфигурации по
+        совпадению пути, а когда его нет (модуля в основной нет ЛИБО раскладки путей разные,
+        CF против EDT) — по имени объекта и типу модуля БЕЗ категории и формы. Перехват модуля
+        объекта справочника прилипает тогда к одноимённому документу, перехват формы — к первой
+        форме объекта, а правильный модуль строку не получает вовсе. Путь модуля В РАСШИРЕНИИ
+        верен всегда, поэтому ключ — идентичность по нему. Кеш живёт до конца сессии, как кеш
+        разбора процедур: индекс — снимок сессии (после пересборки сессию переоткрывают)."""
+        cached = _index_override_cache.get("map")
+        if cached is not None:
+            return cached
+        try:
+            rows = idx_reader.get_extension_overrides("", "") if idx_reader is not None else None
+        except Exception:
+            rows = None
+        # Кешируется ТОЛЬКО успешное чтение: `None` — это и окно пересборки на месте
+        # (`_transient_safe` гасит `database is locked` / `no such table`), и пустая карта навсегда
+        # заглушила бы перехваты до конца сессии; следующий вызов перечитает таблицу.
+        if rows is None:
+            return None
+        by_ident: dict[tuple[str, ...], list[dict]] = {}
+        for r in rows:
+            ident = _override_row_identity(r)
+            if _identity_is_proven(ident):
+                by_ident.setdefault(ident, []).append(r)
+        out = {
+            ident: _group_overrides_by_target((r.get("target_method", ""), r) for r in group)
+            for ident, group in by_ident.items()
+        }
+        _index_override_cache["map"] = out
+        return out
+
+    def _main_module_rel(path: str) -> str | None:
+        """Канонический путь модуля ОСНОВНОЙ конфигурации либо ``None`` (модуль расширения —
+        соседнего ``../cfe/…`` или корня сессии на самом расширении; путь вне корней).
+
+        Без обращения к ФС отвечают ровно две формы — те, в которых пути отдают хелперы (функцию зовёт
+        ``extract_procedures`` на каждом модуле):
+          * относительный путь без ``.``, ``..`` только ведущей группой, у которого текстовый
+            ``_owner_root_for`` нашёл владельца — зарегистрированный префикс ``../cfe/<Имя>/…`` либо корень
+            сессии, открытой на самом расширении → «расширение» (проверка идёт ПЕРВОЙ);
+          * относительный путь без ``.`` и ``..`` вовсе, владельца нет → «основная».
+        Всё прочее — абсолютный путь, ``../cf/../cfe/…``, ``../cfe/<Имя>/../../cf/…``, ведущие ``..``
+        другой длины (``../../src/cfe/<Имя>/…`` — тот же модуль расширения, но префикс текстом не
+        совпадает) — недоверенная форма: текстовой проверке не верим ни в какую сторону, принадлежность
+        решается по ВЛОЖЕННОСТИ резолвнутого пути (``_owner_root_for_resolved``, приём
+        ``_owner_root_for_untrusted``). Один ``resolve()`` — только на такой форме."""
+        norm = _norm_module_path(path)
+        parts = norm.split("/")
+        lead = 0
+        while lead < len(parts) and parts[lead] == "..":
+            lead += 1
+        shaped = not os.path.isabs(norm) and "." not in parts and ".." not in parts[lead:]
+        if shaped:
+            # Порядок существен: владелец — ПЕРВЫМ. В сессии, открытой на самом расширении, путь без
+            # `..` — это модуль корня-расширения (`_owner_root_for` узнаёт его по роли корня), и ответ
+            # «основная» по одному отсутствию `..` вернул бы расширению его собственные перехваты.
+            if _owner_root_for(norm) is not None:
+                return None
+            if lead == 0:
+                return norm
+        try:
+            resolved = _ext_resolve_safe(norm)
+        except (PermissionError, OSError, ValueError):
+            return None
+        if _owner_root_for_resolved(resolved) is not None:
+            return None
+        try:
+            return Path(os.path.relpath(resolved, _base_path_resolved)).as_posix()
+        except ValueError:
             return None
 
-        content = _ext_read_file(path)
-        lines = content.splitlines()
+    def _index_overrides_for_path(path: str) -> dict[str, list[dict]] | None:
+        """Индексная карта перехватов модуля по его идентичности. Единственная точка чтения
+        перехватов индекса для модуля: потребители — ``extract_procedures`` (``overridden_by``),
+        ``read_procedure``, ``get_object_modules``. ``get_overrides_for_path`` (по ``source_path``)
+        хелперы больше не зовут — кроме ветки совместимости ниже. ``None`` — карту перехватов
+        прочитать не удалось (окно пересборки на месте): ответ без перехватов временный, и кеш
+        разбора процедур его не закрепляет.
 
-        start = target["line"] - 1  # convert to 0-based
-        end = target["end_line"] if target["end_line"] is not None else len(lines)
-        # end_line is 1-based and inclusive
-        extracted = lines[start:end]
-        body = "\n".join(extracted)
-
-        if numbered:
-            from rlm_tools_bsl._format import number_lines
-
-            body = number_lines(body, start=target["line"])
-
-        if not include_overrides:
-            return body
-
-        # Enrich with extension override bodies
-        override_list = target.get("overridden_by")
-        if not override_list and idx_reader is not None:
+        Модуль расширения перехватов не получает — перехватывает он. Проверка стоит ЗДЕСЬ, а
+        не только в ``_module_overrides``: ``extract_procedures`` зовёт эту функцию напрямую, и
+        в сессии на расширении карта по идентичности приписала бы модулю его же перехваты (на
+        базе там ``source_path`` пуст, и ``overridden_by`` не появлялся)."""
+        if idx_reader is None:
+            return {}
+        rel = _main_module_rel(path)
+        want = _module_identity(rel) if rel is not None else None
+        if want is None:
+            return {}
+        if not callable(getattr(idx_reader, "get_extension_overrides", None)):
+            # Сторонний ридер прежнего API (``idx_reader`` duck-typed — прецедент v1.36.0): полной
+            # выборки нет, поэтому прежнее чтение по source_path, но со сверкой идентичности —
+            # чужая привязка отсекается, восстановить потерянную нечем.
             try:
-                overrides_map = idx_reader.get_overrides_for_path(path)
-                # Case-insensitive lookup (Cyrillic)
-                ov_lower = {k.lower(): v for k, v in overrides_map.items()}
-                override_list = ov_lower.get(target["name"].lower())
+                raw = idx_reader.get_overrides_for_path(rel) or {}
             except Exception:
-                override_list = None
+                return {}
+            return _group_overrides_by_target(
+                (method, r) for method, rows in raw.items() for r in rows if _override_row_identity(r) == want
+            )
+        overrides = _index_override_map()
+        return None if overrides is None else overrides.get(want, {})
 
-        if not override_list:
-            return body
+    def _module_overrides(path: str) -> dict[str, list[dict]]:
+        """{target_method: [перехваты]} для модуля ОСНОВНОЙ конфигурации ``path``.
 
+        Источник — как у ``get_overrides``: индекс первым (``_index_overrides_for_path``); без
+        индекса — живой обход расширений с отбором по идентичности. Модуль расширения (любой
+        формы пути — см. ``_main_module_rel``) перехватов не получает."""
+        if idx_reader is not None:
+            return _index_overrides_for_path(path) or {}
+        rel = _main_module_rel(path)
+        want = _module_identity(rel) if rel is not None else None
+        if want is None:
+            return {}
+        info = parse_bsl_path(os.path.join(base_path, rel), base_path)
+        # У модуля уровня конфигурации и модуля категории вне словаря (`Sequences/…`) объекта для
+        # разбора нет: отбор по имени невозможен, берутся все перехваты и сверяются по идентичности.
+        object_arg = f"{info.category}/{info.object_name}" if info.category and info.object_name else ""
+        try:
+            rows = get_overrides(object_arg, limit=UNBOUNDED_PAGE)["overrides"]
+        except Exception:
+            return {}
+        return _group_overrides_by_target(
+            (r.get("target_method", ""), r) for r in rows if _override_row_identity(r) == want
+        )
+
+    def _render_override_sections(parts: list[str], override_list: list[dict], numbered: bool) -> str:
+        """Секции перехватов (заголовок, ссылка на файл, тело метода расширения) к ``parts``.
+        Тело ищется только под доверенными корнями (текущий + соседние расширения)."""
         from rlm_tools_bsl.extension_detector import detect_extension_context as _det_ctx
 
+        trusted_roots: set[Path] = set()
         try:
             ext_context = _det_ctx(base_path)
         except Exception:
-            return body
+            # Детектор уже отработал на старте сессии, сбой здесь практически недостижим.
+            # Доверенных корней тогда ноль: секции идут с заголовком и ссылкой на файл, но
+            # без тела (прежде — голое тело без секций; для метода, которого в базе нет,
+            # ответ свёлся бы к одной пометке без перехватов).
+            ext_context = None
+        if ext_context is not None:
+            for e in ext_context.nearby_extensions:
+                trusted_roots.add(Path(e.path).resolve())
+            trusted_roots.add(Path(ext_context.current.path).resolve())
 
-        trusted_roots: set[Path] = set()
-        for e in ext_context.nearby_extensions:
-            trusted_roots.add(Path(e.path).resolve())
-        trusted_roots.add(Path(ext_context.current.path).resolve())
-
-        parts = [body]
         for ov in override_list:
             ext_root = ov.get("extension_root", "")
             ext_mod = ov.get("ext_module_path", "")
@@ -4349,6 +4723,67 @@ def make_bsl_helpers(
 
         return "\n".join(parts)
 
+    def _read_procedure_one(
+        path: str, proc_name: str, include_overrides: bool = False, numbered: bool = False
+    ) -> str | None:
+        """Scalar core of read_procedure (single proc_name). See read_procedure."""
+        procedures = extract_procedures(path)
+        target = None
+        for p in procedures:
+            if p["name"].lower() == proc_name.lower():
+                target = p
+                break
+        if target is None:
+            if not include_overrides:
+                return None
+            # v1.43.0: перехват метода, которого в базовом модуле нет (событие платформы без
+            # обработчика в основной конфигурации), раньше давал None — перехваты не читались.
+            ov_lower = {k.lower(): v for k, v in _module_overrides(path).items()}
+            override_list = ov_lower.get(proc_name.lower())
+            if not override_list:
+                return None
+            # У общего модуля событий платформы нет: перехват метода, которого в базовом модуле нет, там
+            # значит, что выгрузки основной конфигурации и расширения разных версий.
+            rel = _main_module_rel(path)
+            ident = _module_identity(rel) if rel is not None else None
+            if ident and ident[0] == "commonmodules":
+                why = (
+                    "у общего модуля событий платформы нет: метода нет в этой выгрузке основной конфигурации — "
+                    "версии основной конфигурации и расширения разошлись"
+                )
+            else:
+                why = "обычно событие платформы, у которого в основной конфигурации нет обработчика"
+            note = f"// Метод {proc_name} в базовом модуле не объявлен: ниже — его перехваты в расширениях ({why})"
+            return _render_override_sections([note], override_list, numbered)
+
+        content = _ext_read_file(path)
+        lines = content.splitlines()
+
+        start = target["line"] - 1  # convert to 0-based
+        end = target["end_line"] if target["end_line"] is not None else len(lines)
+        # end_line is 1-based and inclusive
+        extracted = lines[start:end]
+        body = "\n".join(extracted)
+
+        if numbered:
+            from rlm_tools_bsl._format import number_lines
+
+            body = number_lines(body, start=target["line"])
+
+        if not include_overrides:
+            return body
+
+        # Enrich with extension override bodies. `overridden_by` — индексная карта
+        # extract_procedures; без индекса (и для метода, которого карта не дала) — та же
+        # карта по идентичности модуля либо живой обход расширений (`_module_overrides`).
+        override_list = target.get("overridden_by")
+        if not override_list:
+            ov_lower = {k.lower(): v for k, v in _module_overrides(path).items()}
+            override_list = ov_lower.get(target["name"].lower())
+        if not override_list:
+            return body
+        return _render_override_sections([body], override_list, numbered)
+
     def read_procedure(path: str, proc_name, include_overrides: bool = False, numbered: bool = False):
         """Extract a single procedure body from a BSL file by name.
         With include_overrides=True, appends extension override bodies if available.
@@ -4357,7 +4792,15 @@ def make_bsl_helpers(
         (P1 list-перегрузка → ``{proc_name: str | None | {error}}``, тело модуля
         парсится один раз благодаря мемоизации ``extract_procedures``). Изоляция:
         ненайденный метод даёт ``None`` под своим ключом, а исключение на элементе —
-        ``{"error": ...}`` (не роняя остальной батч); в обходе проверяй ``'error' in v``."""
+        ``{"error": ...}`` (не роняя остальной батч); в обходе проверяй ``'error' in v``.
+
+        **v1.43.0.** ``include_overrides=True``: метода в базовом модуле нет, а перехваты
+        есть (событие платформы без обработчика в основной конфигурации) — строка-пометка
+        и секции перехватов вместо ``None``; у общего модуля событий платформы нет, и пометка
+        называет расхождение версий основной конфигурации и расширения. Без индекса перехваты берутся живым обходом
+        расширений (раньше — только из индекса). Перехваты сверяются с модулем по
+        идентичности пути модуля в расширении: индексная привязка к модулю одноимённого
+        объекта другой категории или другой формы не выдаётся за перехват этого модуля."""
         return _single_or_map(
             proc_name,
             lambda name: _read_procedure_one(path, name, include_overrides, numbered),
@@ -7286,7 +7729,7 @@ def make_bsl_helpers(
             "_meta": meta,
         }
 
-    def find_definition(name: str, module_hint: str = "", limit: int = 50) -> dict:
+    def find_definition(name, module_hint: str = "", limit: int = 50) -> dict:
         """Where a method is defined — forward complement of find_callers_context.
 
         Lists every module that defines a procedure/function ``name`` (case-
@@ -7325,7 +7768,15 @@ def make_bsl_helpers(
         проекции. ``_meta.total_exact`` отделяет ДОКАЗАННО полный итог от нижней
         оценки; ``slow_fallback`` по-прежнему означает только кириллический
         ``py_lower``-rescan индексного ридера и на live-ветках всегда ``False``.
+
+        **v1.43.0.** ``name`` — ``str`` ИЛИ ``list[str]``: список даёт
+        ``{имя: ответ | {"error": ...}}`` с общими ``module_hint``/``limit``; ошибка одного
+        элемента не роняет остальные (как у ``find_callers_context``/``read_procedure``).
         """
+        return _single_or_map(name, lambda one: _find_definition_one(one, module_hint, limit))
+
+    def _find_definition_one(name: str, module_hint: str = "", limit: int = 50) -> dict:
+        """Скалярное ядро ``find_definition`` (прежнее тело без изменений)."""
         limit, _w = _coerce_bound(limit, 50, "limit", "find_definition(name, module_hint='', limit=50)")
         if not name or not name.strip():
             return {
@@ -9062,6 +9513,27 @@ def make_bsl_helpers(
 
     _REF_HEAD_TO_CATEGORY = {head: folder for folder, head in _CATEGORY_TO_REF_HEAD.items()}
 
+    # Виды метаданных с модулями, но без ссылочного типа: `_normalize_object_ref` их голов не знает, а
+    # полное имя объекта (`ОбщийМодуль.X` — так его отдает `Метаданные.ОбщиеМодули.X.ПолноеИмя()`) и путь с
+    # русским множественным (`ОбщиеМодули/X`) — тот же префикс категории, что `Документ.X`. Ключ — голова
+    # в нижнем регистре: единственное число RU/EN и множественное RU (EN-множественное — имя каталога,
+    # его понимает `_normalize_category`).
+    _NONREF_KIND_CATEGORIES = {
+        head.casefold(): folder
+        for folder, heads in (
+            ("CommonModules", ("ОбщийМодуль", "CommonModule", "ОбщиеМодули")),
+            ("CommonForms", ("ОбщаяФорма", "CommonForm", "ОбщиеФормы")),
+            ("CommonCommands", ("ОбщаяКоманда", "CommonCommand", "ОбщиеКоманды")),
+            ("HTTPServices", ("HTTPСервис", "HTTPService", "HTTPСервисы")),
+            ("WebServices", ("WebСервис", "WebService", "WebСервисы")),
+            ("DocumentJournals", ("ЖурналДокументов", "DocumentJournal", "ЖурналыДокументов")),
+            ("FilterCriteria", ("КритерийОтбора", "FilterCriterion", "КритерииОтбора")),
+            ("SettingsStorages", ("ХранилищеНастроек", "SettingsStorage", "ХранилищаНастроек")),
+            ("ExternalDataSources", ("ВнешнийИсточникДанных", "ExternalDataSource", "ВнешниеИсточникиДанных")),
+        )
+        for head in heads
+    }
+
     def _split_typed_name(raw: str) -> tuple[str, str]:
         """``('Documents', 'X')`` для ``'Документ.X'`` / ``'документ.X'`` / ``'Document.X'``;
         ``('', X)`` иначе, где X — то, что отдал бы прежний ``_strip_meta_prefix``.
@@ -9076,7 +9548,32 @@ def make_bsl_helpers(
         category = _REF_HEAD_TO_CATEGORY.get(head, "") if dot else ""
         if category and rest:
             return category, rest
+        head, dot, rest = (raw or "").strip().partition(".")
+        category = _NONREF_KIND_CATEGORIES.get(head.casefold(), "") if dot else ""
+        if category and rest:
+            return category, rest
         return "", _strip_meta_prefix(raw)
+
+    def _split_object_arg(raw: str) -> tuple[str, str]:
+        """``(категория, имя)``: путь ``Категория/Имя`` (категория по словарю категорий, в т.ч.
+        русская и единственное число) либо ссылка ``Документ.X``/``Document.X`` (через
+        ``_split_typed_name``, регистр префикса не важен). Голое имя — ``('', имя)``.
+        Категория — КАНОНИЧЕСКИЙ каталог (``Documents``), как у ``_split_typed_name``:
+        ``'Документы/X'`` и ``'documents/X'`` дают ту же категорию, что ``'Documents/X'``."""
+        raw = (raw or "").strip()
+        head, slash, tail = raw.partition("/")
+        if slash and tail:
+            # Множественное число RU/EN (`Документы`, `documents`) — карта коллекций менеджеров
+            # (`_CALL_MANAGER_COLLECTIONS`, общий источник `_RU_META_FORMS`): в словаре
+            # `_normalize_category` русского множественного нет (`документ` есть, `документы` — нет).
+            cat = _CALL_MANAGER_COLLECTIONS.get(head.casefold()) or _NONREF_KIND_CATEGORIES.get(head.casefold())
+            if cat:
+                return cat, tail
+            norm = _normalize_category(head)
+            for cat in _known_categories():
+                if cat.lower() == norm:
+                    return cat, tail
+        return _split_typed_name(raw)
 
     def get_object_full_structure(name: str, category_hint: str | None = None) -> dict:
         """Aggregating helper: full object structure in one call.
@@ -9650,7 +10147,7 @@ def make_bsl_helpers(
 
         return result
 
-    def _resolve_object_for_modules(name: str):
+    def _resolve_object_for_modules(name: str, category: str = ""):
         """``(category, object_name, modules)`` для объекта одним прямым exact-сканом
         ``_index_state`` — НЕ через capped ``find_module`` и НЕ через
         ``_resolve_object_for_full_structure`` напрямую (оба возвращают на шаг раньше
@@ -9664,6 +10161,10 @@ def make_bsl_helpers(
         прямой скан пуст, с повторным exact-сканом по канон-имени (чтобы capped/fuzzy
         путь резолвера никогда не был источником финального списка модулей).
         ``(None, None, [])`` если ничего не нашлось.
+
+        ``category`` (v1.43.0, канонический каталог из префикса типа ``Документ.X``) —
+        объект ТОЛЬКО этой категории: прямой скан с фильтром категории, синонимный маршрут
+        выбирает кандидата этой категории ДО выбора канона. Пусто — прежнее поведение.
         """
         _ensure_index()
 
@@ -9686,6 +10187,33 @@ def make_bsl_helpers(
             cat_lower = (category or "").lower()
             modules = [(rel, info) for rel, info in rows if (info.category or "").lower() == cat_lower]
             return category, object_name, modules
+
+        if category:
+            found = _scan(name.lower(), category.lower())
+            if found[2]:
+                return found
+            want = _normalize_category(category)
+            try:
+                # Без потолка: ридер режет выдачу ПОСЛЕ межкатегорийной сортировки
+                # (`ranked[:limit]`), и при 50+ совпадениях другой категории объект нужной
+                # ушёл бы за срез. Кандидат категории выбирается ДО канона: каскад
+                # `_resolve_object_for_full_structure` отдаёт ОДИН канон, и общий синоним
+                # справочника и документа дал бы ложное «не найден».
+                hits = search_objects(name, limit=UNBOUNDED_PAGE)
+            except Exception:
+                hits = []
+            # `search_objects` ищет ПОДСТРОКОЙ: принимается только доказанное совпадение — точное
+            # имя либо точный синоним (хвост после «Категория: », как у ранжира поиска). Иначе
+            # `Документ.Склад` отвечал бы `СкладАрхив`, а не «нет в категории».
+            target = name.strip().lower()
+            for r in hits if isinstance(hits, list) else []:
+                if not r.get("object_name") or _normalize_category(r.get("category") or "") != want:
+                    continue
+                synonym = (r.get("synonym") or "").lower()
+                synonym = synonym.split(": ", 1)[-1] if ": " in synonym else synonym
+                if r["object_name"].lower() == target or synonym.strip() == target:
+                    return _scan(r["object_name"].lower(), category.lower())
+            return None, None, []
 
         category, object_name, modules = _scan(name.lower())
         if modules:
@@ -9720,7 +10248,7 @@ def make_bsl_helpers(
             ov_methods: list[str] = []
             if idx_reader is not None:
                 try:
-                    ov_map = idx_reader.get_overrides_for_path(rel) or {}
+                    ov_map = _index_overrides_for_path(rel) or {}
                     ov_methods = sorted(ov_map.keys())
                 except Exception:
                     ov_methods = []
@@ -9830,12 +10358,18 @@ def make_bsl_helpers(
 
         Дизамбигуация: метаданные → ``get_object_full_structure``; код-скелет →
         ``get_object_modules``; тяжёлый разбор тел → ``analyze_object``.
+
+        **v1.43.0.** Префикс типа (``Документ.X``, ``documents/X``) — категория: на омониме
+        отвечает объект ЭТОЙ категории (раньше префикс отбрасывался, и отвечал объект любой
+        категории), объекта в ней нет — ``error``. Голое имя — прежний выбор.
         """
-        name = _strip_meta_prefix(name)
-        category, object_name, modules = _resolve_object_for_modules(name)
+        want_cat, bare = _split_object_arg(name)
+        name = _strip_meta_prefix(bare)
+        category, object_name, modules = _resolve_object_for_modules(name, want_cat)
         if not modules:
+            where = f" в категории {want_cat}" if want_cat else ""
             return {
-                "error": f"Объект '{name}' не найден (нет модулей в индексе)",
+                "error": f"Объект '{name}'{where} не найден (нет модулей в индексе)",
                 "_meta": {"index_used": idx_reader is not None, "modules_truncated": False},
             }
 
@@ -10799,6 +11333,9 @@ def make_bsl_helpers(
             event_filter: List of event substrings (case-insensitive) — отбор
                           по полю event. None = без фильтра. ['BeforeWrite']
                           вернёт все подписки, у которых event содержит 'beforewrite'.
+                          В поле event — английское имя события, как в XML
+                          подписки: русское имя обработчика ('ПередЗаписью')
+                          не совпадает никогда.
                           Допустима **одна строка** ('BeforeWrite') — она будет
                           автоматически обёрнута в [event_filter] (типичная ошибка
                           агентов: голая строка раньше итерировалась по символам
@@ -11387,7 +11924,24 @@ def make_bsl_helpers(
             if handler_pos < 0:
                 continue
             outside_code = full_code[:handler_pos] + full_code[handler_pos + len(handler_code) :]
-            handler_only = _live_movement_names(handler_code) - _live_movement_names(outside_code)
+            handler_names = _live_movement_names(handler_code)
+            outside_names = _live_movement_names(outside_code)
+            # v1.43.0: делегат «регистр по имени» участвует в той же разности — по строкам:
+            # литерал в диапазоне ОбработкаПроведения (живой разбор) — «в обработчике», иначе «вне».
+            by_name_literal, _by_name_dynamic = _register_by_name_refs(body)
+            if by_name_literal:
+                span = None
+                try:
+                    for proc in _parse_procedures(rel_path):
+                        if (proc.get("name") or "").casefold() == "обработкапроведения":
+                            span = (proc["line"], proc.get("end_line") or sys.maxsize)  # незакрытая — до конца
+                            break
+                except Exception:
+                    span = None
+                for register_name, line_no in by_name_literal:
+                    inside = span is not None and span[0] <= line_no <= span[1]
+                    (handler_names if inside else outside_names).add(register_name.casefold())
+            handler_only = handler_names - outside_names
             path_key = rel_path.replace("\\", "/").casefold()
             suppressible.update((path_key, register_name) for register_name in handler_only)
         return suppressible
@@ -11471,12 +12025,42 @@ def make_bsl_helpers(
             "проверь тело указанного в _meta.cfe_posting_replacement перехвата. "
         )
 
+    _known_registers_cache: dict[str, frozenset[str]] = {}
+
+    def _known_registers(root: str) -> frozenset[str]:
+        """Имена регистров корня (нижний регистр, каталоги на диске) — ленивый кеш сессии."""
+        key = _root_key_safe(root)
+        cached = _known_registers_cache.get(key)
+        if cached is None:
+            from rlm_tools_bsl.bsl_index import _known_register_names
+
+            try:
+                cached = _known_register_names(Path(root))
+            except Exception:
+                cached = frozenset()
+            _known_registers_cache[key] = cached
+        return cached
+
+    def _is_known_register(name: str, path: str) -> bool:
+        """Литерал делегата «регистр по имени» — существующий регистр? Модуль основной
+        конфигурации сверяется с регистрами основной; модуль расширения — с объединением
+        регистров основной и СВОЕГО расширения (расширение может добавить регистр)."""
+        low = name.lower()
+        if low in _known_registers(base_path):
+            return True
+        root = _owner_root_for(path)
+        return root is not None and low in _known_registers(root)
+
     def _live_main_alias_movements(document_name: str) -> list[dict]:
         """Read-time bridge for English ``RegisterRecords.X`` on old SQLite builds.
 
         The persisted extractor remains unchanged in 1.28.0, so no builder-version
         migration is needed. Only the exact main ObjectModule is inspected and only
         English collection references are added; Russian rows keep their index contract.
+
+        v1.43.0: мост чтения покрывает ДВА источника — ещё и делегата «регистр по имени»
+        (``_REGISTER_BY_NAME_DELEGATES``): литерал из каталога регистров даёт строку
+        ``source='code'`` того же модуля; сборщик такие вызовы не видит.
         """
         rows: list[dict] = []
         seen: set[tuple[str, str]] = set()
@@ -11485,13 +12069,21 @@ def make_bsl_helpers(
             if body is None:
                 continue
             code = _live_code_only(body)
-            if not re.search(r"\bRegisterRecords\s*\.", code, re.IGNORECASE):
-                continue
-            for movement in _MOVEMENTS_LIVE_RE.finditer(code):
-                if not movement.group(0).lstrip().casefold().startswith("registerrecords"):
-                    continue
-                register_name = movement.group(1)
-                if register_name.casefold() in _MOVEMENT_METHOD_NOISE:
+            if re.search(r"\bRegisterRecords\s*\.", code, re.IGNORECASE):
+                for movement in _MOVEMENTS_LIVE_RE.finditer(code):
+                    if not movement.group(0).lstrip().casefold().startswith("registerrecords"):
+                        continue
+                    register_name = movement.group(1)
+                    if register_name.casefold() in _MOVEMENT_METHOD_NOISE:
+                        continue
+                    key = (path.replace("\\", "/").casefold(), register_name.casefold())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append({"register_name": register_name, "source": "code", "file": path})
+            literal, _dynamic = _register_by_name_refs(body)
+            for register_name, _line in literal:
+                if not _is_known_register(register_name, path):
                     continue
                 key = (path.replace("\\", "/").casefold(), register_name.casefold())
                 if key in seen:
@@ -11499,6 +12091,64 @@ def make_bsl_helpers(
                 seen.add(key)
                 rows.append({"register_name": register_name, "source": "code", "file": path})
         return rows
+
+    def _live_by_name_unresolved(document_name: str) -> list[dict]:
+        """Строки ``source='unresolved'`` делегата «регистр по имени» в точных модулях объекта
+        документа — основной конфигурации и соседних расширений (те же модули, что читают
+        ``_live_main_alias_movements`` и ``_live_extension_movements``): вычисляемое имя —
+        ``kind='dynamic_name'``, литерал вне каталога регистров — ``kind='unknown_register'``
+        (``evidence`` — выражение/имя). Нечитаемый модуль расширения пропускается: его уже
+        объявил неполным проход ``_live_extension_movements``."""
+        bodies: list[tuple[str, str]] = []
+        for path in _live_main_object_module_paths(document_name):
+            body = _live_main_object_module_body(path)
+            if body is not None:
+                bodies.append((path, body))
+        for path in _live_extension_object_module_paths(document_name):
+            try:
+                bodies.append((path, _ext_read_file(path)))
+            except Exception:
+                continue
+        rows: list[dict] = []
+        for path, body in bodies:
+            literal, dynamic = _register_by_name_refs(body)
+            for expr, _line in dynamic:
+                rows.append(
+                    {
+                        "register_name": "",
+                        "source": "unresolved",
+                        "kind": "dynamic_name",
+                        "evidence": expr,
+                        "file": path,
+                    }
+                )
+            for register_name, _line in literal:
+                if not _is_known_register(register_name, path):
+                    rows.append(
+                        {
+                            "register_name": "",
+                            "source": "unresolved",
+                            "kind": "unknown_register",
+                            "evidence": register_name,
+                            "file": path,
+                        }
+                    )
+        return rows
+
+    def _live_extension_object_module_paths(document_name: str) -> list[str]:
+        """Точные модули объекта документа в соседних расширениях (порядок — по пути)."""
+        if not _ext_paths_raw:
+            return []
+        _ensure_index()
+        target = (document_name or "").casefold()
+        return sorted(
+            rel_path
+            for rel_path, info in _index_state
+            if rel_path in _extension_paths_set
+            and (info.category or "") == "Documents"
+            and info.module_type == "ObjectModule"
+            and (info.object_name or "").casefold() == target
+        )
 
     def _live_extension_movements(
         document_name: str,
@@ -11520,16 +12170,7 @@ def make_bsl_helpers(
         """
         if not _ext_paths_raw:
             return [], [], [], []
-        _ensure_index()
-        target = (document_name or "").casefold()
-        candidates = sorted(
-            rel_path
-            for rel_path, info in _index_state
-            if rel_path in _extension_paths_set
-            and (info.category or "") == "Documents"
-            and info.module_type == "ObjectModule"
-            and (info.object_name or "").casefold() == target
-        )
+        candidates = _live_extension_object_module_paths(document_name)
         rows: list[dict] = []
         scanned: list[str] = []
         unreadable: list[str] = []
@@ -11560,25 +12201,39 @@ def make_bsl_helpers(
                             "file": path,
                         }
                     )
+            # v1.43.0: делегат «регистр по имени» в модуле расширения (например, в перехвате
+            # &После("ОбработкаПроведения")) — тот же детектор, что у основной конфигурации:
+            # иначе он погасил бы сигнал обработчика, не добавив движения.
+            literal, _dynamic = _register_by_name_refs(raw_body)
+            for register_name, _line in literal:
+                if not _is_known_register(register_name, path):
+                    continue
+                key = (register_name.casefold(), path.replace("\\", "/").casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"register_name": register_name, "source": "code", "file": path})
         return rows, scanned, unreadable, posting_interceptors
 
     def _merge_movement_rows(base_rows: list[dict], extra_rows: list[dict]) -> list[dict]:
         """Add movement rows without changing the existing reader row semantics/order."""
+
+        def _key(row: dict) -> tuple[str, ...]:
+            key: tuple[str, ...] = (
+                str(row.get("register_name") or "").casefold(),
+                str(row.get("source") or "").casefold(),
+                str(row.get("file") or "").replace("\\", "/").casefold(),
+            )
+            if key[1] == "unresolved":
+                # v1.43.0: у строк `unresolved` имя регистра пустое — без вида и улики две
+                # вычисляемые строки одного файла схлопнулись бы в одну.
+                key += (str(row.get("kind") or ""), str(row.get("evidence") or ""))
+            return key
+
         merged = list(base_rows)
-        seen = {
-            (
-                str(row.get("register_name") or "").casefold(),
-                str(row.get("source") or "").casefold(),
-                str(row.get("file") or "").replace("\\", "/").casefold(),
-            )
-            for row in merged
-        }
+        seen = {_key(row) for row in merged}
         for row in extra_rows:
-            key = (
-                str(row.get("register_name") or "").casefold(),
-                str(row.get("source") or "").casefold(),
-                str(row.get("file") or "").replace("\\", "/").casefold(),
-            )
+            key = _key(row)
             if key not in seen:
                 seen.add(key)
                 merged.append(row)
@@ -11603,7 +12258,15 @@ def make_bsl_helpers(
                  ``delegates`` — ограниченная первая страница имён получателей,
                  разобранных из тела, плюс ``delegates_total`` и
                  ``delegates_truncated``. Пагинации эта страница НЕ обещает: полный
-                 разбор идёт через ``hint``. Без обработчика ключей нет вовсе."""
+                 разбор идёт через ``hint``. Без обработчика ключей нет вовсе.
+
+        **v1.43.0.** Делегат «регистр по имени» из таблицы ``_REGISTER_BY_NAME_DELEGATES``
+        (``ПроведениеСервер.ОтразитьДвиженияПоРегистру(…, "ИмяРегистра")``) с литералом из
+        каталога регистров даёт строку ``code_registers`` (``source='code'``, ``file`` — модуль
+        вызова, в том числе модуль расширения); вычисляемое имя и литерал вне каталога — строки
+        ``unresolved`` (``dynamic_name`` / ``unknown_register``; канал доступен только на индексе
+        v16+). ``declared_by_kind`` — ПОЛНЫЙ объявленный состав по видам регистров; при усечённой
+        странице ``declared_registers`` маршрут к полному списку — ``_meta.declared_route``."""
         # `_meta` здесь условный (ставится setdefault и может отсутствовать), поэтому
         # предупреждение уходит в лог, а не в ответ.
         posting_calls_offset, _w = _coerce_bound(
@@ -11667,6 +12330,12 @@ def make_bsl_helpers(
                             "extension_modules_unreadable": cfe_modules_unreadable,
                         }
                     )
+                if getattr(idx_reader, "has_declared_composition", False):
+                    # v1.43.0: вычисляемое имя и литерал вне каталога у делегата «регистр по
+                    # имени» — в канал `unresolved` (он доступен только на индексе v16+), из модулей
+                    # основной конфигурации и расширений: канал объявлен доступным, и потерянная
+                    # строка расширения дала бы ложное «всё разрешилось».
+                    idx_movements = _merge_movement_rows(idx_movements, _live_by_name_unresolved(document_name))
                 _attach_declared_and_unresolved(result, document_name, idx_movements, rows_from_index=True)
                 _maybe_add_postability_hint(result, document_name)
                 _maybe_add_posting_handler_hint(result, document_name, posting_calls_offset)
@@ -11744,6 +12413,19 @@ def make_bsl_helpers(
                         live_code_rows.append(row)
                     if i not in live_code_by_origin[origin_key]["lines"]:
                         live_code_by_origin[origin_key]["lines"].append(i)
+            # v1.43.0: делегат «регистр по имени» — тем же порядком, что и `Движения.X`
+            # (имя, строка, файл), в модулях основной конфигурации и расширений.
+            by_name_literal, _by_name_dynamic = _register_by_name_refs(content)
+            for reg_name, i in by_name_literal:
+                if not _is_known_register(reg_name, path):
+                    continue
+                origin_key = (reg_name.casefold(), path.replace("\\", "/").casefold())
+                if origin_key not in live_code_by_origin:
+                    row = {"name": reg_name, "lines": [], "file": path}
+                    live_code_by_origin[origin_key] = row
+                    live_code_rows.append(row)
+                if i not in live_code_by_origin[origin_key]["lines"]:
+                    live_code_by_origin[origin_key]["lines"].append(i)
 
         _active, _suppressed, pre_replacement_meta = _apply_cfe_posting_replacement([], cfe_interceptors)
         suppressible_main_rows = (
@@ -11870,6 +12552,18 @@ def make_bsl_helpers(
         result["declared_registers"] = page
         result["declared_total"] = len(declared or [])
         result["declared_truncated"] = len(declared or []) > len(page)
+        by_kind: dict[str, int] = {}
+        for ref in declared or []:
+            head = ref.split(".", 1)[0] if "." in ref else ""
+            by_kind[head] = by_kind.get(head, 0) + 1
+        # v1.43.0: ПОЛНЫЙ состав по видам ВСЕГДА: страница режется по бюджету вывода, и без
+        # разбивки за её границей пропадает целый вид (на боевом документе — все регистры
+        # сведений).
+        result["declared_by_kind"] = dict(sorted(by_kind.items()))
+        if result["declared_truncated"]:
+            result.setdefault("_meta", {})["declared_route"] = (
+                f"полный список: parse_object_xml('Documents/{document_name}')['register_records']"
+            )
         if reason:
             result.setdefault("_meta", {})["declared_reason"] = reason
 
@@ -13427,6 +14121,16 @@ def make_bsl_helpers(
                 if ignore_main_movements and movement_key in suppressible_main_rows:
                     continue
                 return None  # выполняемое движение ЕСТЬ живьём → handler-сигнала быть не должно
+        # v1.43.0: делегат «регистр по имени» — тот же детектор и те же модули, что у строк движений:
+        # сигнал гаснет ровно тогда, когда строка движения появилась в ответе.
+        for rel_path in candidates:
+            for register_name, _line in _register_by_name_refs(bodies.get(rel_path) or "")[0]:
+                if not _is_known_register(register_name, rel_path):
+                    continue
+                movement_key = (rel_path.replace("\\", "/").casefold(), register_name.casefold())
+                if ignore_main_movements and movement_key in suppressible_main_rows:
+                    continue
+                return None
         return handler_path, (bodies.get(handler_path) or ""), interceptors
 
     def _maybe_add_posting_handler_hint(result: dict, document_name: str, posting_calls_offset: int = 0) -> None:
@@ -13610,7 +14314,9 @@ def make_bsl_helpers(
         except Exception as exc:
             based_on = {"error": f"{type(exc).__name__}: {exc}"}
         try:
-            print_forms_data = find_print_forms(document_name)
+            # v1.43.0: композит по смыслу документный — категория задана явно, иначе голое имя
+            # документа без модуля менеджера ушло бы в перебор категорий и взяло справочник-омоним.
+            print_forms_data = find_print_forms(f"Документ.{document_name}")
         except Exception as exc:
             print_forms_data = {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -14077,6 +14783,70 @@ def make_bsl_helpers(
 
         return result
 
+    def _exact_modules(category: str | None, object_name: str, module_type: str) -> list[dict]:
+        """Точные модули объекта из каталога сессии (основная первой, затем расширения).
+        ``category=None`` — любая категория (один проход вместо перебора категорий)."""
+        _ensure_index()
+        target = object_name.casefold()
+        rows = [
+            _info_to_dict(rel, info)
+            for rel, info in _index_state
+            if (category is None or (info.category or "") == category)
+            and (info.object_name or "").casefold() == target
+            and info.module_type == module_type
+        ]
+        rows.sort(key=lambda r: (r["path"] in _extension_paths_set, r["path"]))
+        return rows
+
+    def _object_exists(category: str, name: str) -> bool:
+        """Объект с ТОЧНЫМ именем есть (основная конфигурация или расширения), в том числе
+        без BSL-модулей: модули — по каталогу сессии, объекты основной без модулей —
+        метаданным каскадом ``_resolve_object_categories``, XML-only объекты расширений —
+        по ``_extension_metadata_xml`` (тот же союз, что у стража
+        ``_refuse_object_name_as_element_name``). ``category`` (каталог) сужает, пусто — любая."""
+        if not name:
+            return False
+        _ensure_index()  # наполняет и _index_state, и _extension_metadata_xml
+        target = name.casefold()
+        cats = {
+            info.category
+            for _rel, info in _index_state
+            if info.category and (info.object_name or "").casefold() == target
+        }
+        cats.update(_resolve_object_categories(name))
+        cats.update(cat for cat, obj_name, _rel in (_extension_metadata_xml or ()) if obj_name.casefold() == target)
+        if category:
+            want = _normalize_category(category)
+            cats = {c for c in cats if _normalize_category(c) == want}
+        return bool(cats)
+
+    def _pf_delegate_module(receiver: list[str], caller_path: str, method: str) -> str | None:
+        """Модуль получателя делегата: ``Модуль`` — общий модуль; ``Документы.X`` и прочие
+        коллекции менеджеров — модуль менеджера; иное — ``None``.
+
+        Правило видимости — то же, что у вызовов расширений в графе (``_ext_resolve_callee``):
+        код расширения видит своё расширение, затем основную конфигурацию, чужое — нет; код
+        основной конфигурации видит только её. Своё расширение выигрывает, только если его
+        копия модуля ОБЪЯВЛЯЕТ метод (процедура, добавленная расширением в заимствованный
+        модуль, есть лишь в копии); иначе — модуль основной конфигурации."""
+        if len(receiver) == 1:
+            mods = _exact_modules("CommonModules", receiver[0], "Module")
+        elif len(receiver) == 2:
+            category = _CALL_MANAGER_COLLECTIONS.get(receiver[0].casefold())
+            mods = _exact_modules(category, receiver[1], "ManagerModule") if category else []
+        else:
+            return None
+        caller_root = _owner_root_for(caller_path)
+        own = [m["path"] for m in mods if caller_root is not None and _owner_root_for(m["path"]) == caller_root]
+        main = [m["path"] for m in mods if _owner_root_for(m["path"]) is None]
+        target = method.casefold()
+        for path in own:
+            if any((p.get("name") or "").casefold() == target for p in extract_procedures(path)):
+                return path
+        if main:
+            return main[0]
+        return own[0] if own else None
+
     def find_print_forms(object_name: str) -> dict:
         """Find print forms registered for an object by parsing ДобавитьКомандыПечати in ManagerModule.
 
@@ -14089,12 +14859,28 @@ def make_bsl_helpers(
         называет его), ``not_set``
         (представление в этом модуле не присваивается). ``presentation=None`` значит
         «не литерал в этом модуле», а не «пустое представление». Порядок строк —
-        порядок в коде; кавычки 1С декодируются. ``_meta.delegates`` — вызовы,
-        которым процедура передаёт ВЕСЬ список (``Модуль.ДобавитьКомандыПечати(…)``):
-        туда хелпер не ходит, но называет их.
+        порядок в коде; кавычки 1С декодируются.
+
+        **v1.43.0.** Объект — ТОЧНЫЙ (префикс типа ``Документ.X``/``Documents/X`` —
+        категория); подстрочный маршрут остался только для фрагмента имени, которого как
+        объекта нет вовсе — раньше он подмешивал команды однокоренных документов, а
+        документ без модуля менеджера получал чужие. ``_meta.delegates`` — прежний список
+        вызовов, которым модуль объекта передаёт ВЕСЬ список; хелпер их РАСКРЫВАЕТ: до
+        ``_PF_DELEGATE_MAX_DEPTH`` переходов, только тот же список команд, точный модуль
+        получателя (код расширения — своё расширение, затем основная; код основной — только
+        основная). Строки делегата идут после своих, ``file`` — модуль делегата, команда с
+        тем же ``name`` — первое вхождение. Что не раскрыто и почему —
+        ``_meta.delegates_expanded[i].status`` (``expanded | other_list | module_not_found |
+        procedure_not_found | cycle | depth_limit | unsupported_receiver``); ключ есть, только
+        когда у объекта есть делегаты. Запись — вызов на своём переходе (``depth``): ``cycle`` —
+        вызов процедуры, которая уже на пути обхода; повторный вызов делегата по другому пути —
+        ``expanded`` (``commands`` — сколько добавлено НОВЫХ строк), а делегат, достигнутый за
+        меньшее число переходов, раскрывается заново — поэтому ``depth_limit`` длинного пути может
+        соседствовать с ``expanded`` того же делегата на коротком.
 
         Returns: dict with object, print_forms list, _meta."""
-        object_name = _strip_meta_prefix(object_name)
+        want_cat, bare = _split_object_arg(object_name)
+        object_name = _strip_meta_prefix(bare)
         rows: list[dict] = []
         delegates: list[str] = []
         result: dict = {
@@ -14103,28 +14889,103 @@ def make_bsl_helpers(
             "_meta": {"delegates": delegates},
         }
 
-        modules = find_by_type("Documents", object_name)
-        mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
+        # Точный объект первым (как у find_register_movements/find_based_on_documents): подстрочный
+        # find_by_type подмешивал команды однокоренных документов и резал выдачу на 50 модулях.
+        mgr_modules = _exact_modules("Documents", object_name, "ManagerModule") if want_cat in ("", "Documents") else []
         if not mgr_modules:
-            # Try broader search (Catalogs, DataProcessors, etc.)
-            modules = find_module(object_name)
+            any_category = _exact_modules(None, object_name, "ManagerModule")
+            for cat in [want_cat] if want_cat else sorted(_known_categories()):
+                mgr_modules = [m for m in any_category if (m.get("category") or "") == cat]
+                if mgr_modules:
+                    break
+        if not mgr_modules and not _object_exists(want_cat, object_name):
+            # Фрагмент имени (такого объекта нет вовсе) — прежний подстрочный маршрут; заданная
+            # категория сохраняется. СУЩЕСТВУЮЩИЙ объект без модуля менеджера сюда не попадает:
+            # иначе документ без печати получил бы команды однокоренного документа.
+            modules = find_by_type(want_cat or "Documents", object_name)
             mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
+            if not mgr_modules and not want_cat:
+                modules = find_module(object_name)
+                mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
 
         seen_ids: set[str] = set()
+        expanded: list[dict] = []
+        # Цикл — только вызов процедуры со СТЕКА обхода. Делегат, до которого ведут два пути, циклом не
+        # является: повторный заход на том же или большем переходе ничего нового не даст (его строки и
+        # делегаты уже в ответе), а заход за меньшее число переходов раскрывает его заново — иначе порядок
+        # вызовов в коде решал бы, дойдёт ли обход до делегатов в пределах `_PF_DELEGATE_MAX_DEPTH`.
+        best_depth: dict[tuple[str, str], int] = {}
+        stack: set[tuple[str, str]] = set()
+        missing: set[tuple[str, str]] = set()
+
+        def _take(mod_rows: list[dict]) -> int:
+            added = 0
+            for row in mod_rows:
+                if row["name"] not in seen_ids:
+                    seen_ids.add(row["name"])
+                    rows.append(row)
+                    added += 1
+            return added
+
+        def _expand(body: str, caller_path: str, depth: int) -> None:
+            coll, calls = _pf_list_delegate_calls(body)
+            for call in calls:
+                entry = {"call": call["expr"], "module": "", "depth": depth, "status": "", "commands": 0}
+                expanded.append(entry)
+                if call["list_arg"].casefold() != coll.casefold():
+                    entry["status"] = "other_list"
+                    continue
+                if depth > _PF_DELEGATE_MAX_DEPTH:
+                    entry["status"] = "depth_limit"
+                    continue
+                if len(call["receiver"]) > 2:
+                    entry["status"] = "unsupported_receiver"
+                    continue
+                module = _pf_delegate_module(call["receiver"], caller_path, call["method"])
+                if not module:
+                    entry["status"] = "module_not_found"
+                    continue
+                entry["module"] = module
+                key = (module.casefold(), call["method"].casefold())
+                if key in stack:
+                    entry["status"] = "cycle"
+                    continue
+                if key in missing:
+                    entry["status"] = "procedure_not_found"
+                    continue
+                if best_depth.get(key, depth + 1) <= depth:
+                    entry["status"] = "expanded"  # уже раскрыт с не меньшим запасом: новых строк нет
+                    continue
+                sub = read_procedure(module, call["method"])
+                if not sub:
+                    missing.add(key)
+                    entry["status"] = "procedure_not_found"
+                    continue
+                best_depth[key] = depth
+                sub_rows, _names = _parse_print_commands(sub, module)
+                entry["commands"] = _take(sub_rows)
+                entry["status"] = "expanded"
+                stack.add(key)
+                _expand(sub, module, depth + 1)
+                stack.discard(key)
+
         for mod in mgr_modules:
             path = mod["path"]
             body = read_procedure(path, "ДобавитьКомандыПечати")
             if not body:
                 continue
+            root_key = (path.casefold(), "добавитькомандыпечати")
+            best_depth[root_key] = 0
             mod_rows, mod_delegates = _parse_print_commands(body, path)
-            for row in mod_rows:
-                if row["name"] not in seen_ids:
-                    seen_ids.add(row["name"])
-                    rows.append(row)
+            _take(mod_rows)
             for d in mod_delegates:
                 if d not in delegates:
                     delegates.append(d)
-
+            stack.add(root_key)
+            _expand(body, path, 1)
+            stack.discard(root_key)
+        if expanded:
+            result["_meta"]["delegates_expanded"] = expanded
         return result
 
     # ── Form XML parsing helper ──────────────────────────────────
@@ -14291,13 +15152,23 @@ def make_bsl_helpers(
             form = forms[key]
             kind = r.get("kind", "")
             if kind == "handler":
+                scope = r.get("scope", "")
+                # v1.43.0: CF — события уровня формы делились по неверному списку, и старые
+                # индексы хранят прежний scope. Переклассификация той же функцией, что у
+                # разборщика, идемпотентна; EDT не трогается — там scope взят из структуры файла.
+                if (
+                    scope in ("form", "ext_info")
+                    and not r.get("element_name")
+                    and str(r.get("file") or "").endswith("Form.xml")
+                ):
+                    scope = cf_form_event_scope(r.get("event", ""))
                 h = {
                     "element": r.get("element_name", ""),
                     "event": r.get("event", ""),
                     "handler": r.get("handler", ""),
                     "element_type": r.get("element_type", ""),
                     "data_path": r.get("data_path", ""),
-                    "scope": r.get("scope", ""),
+                    "scope": scope,
                 }
                 if handler_filter:
                     if h["handler"].lower() == handler_filter.lower():
@@ -14780,11 +15651,9 @@ def make_bsl_helpers(
         raw = (name or "").strip()
         if not raw or not name_search_exact:
             return
-        head, slash, tail = raw.partition("/")
-        if slash and tail and _normalize_category(head) in {c.lower() for c in _known_categories()}:
-            wanted_category, bare = head, tail
-        else:
-            wanted_category, bare = _split_typed_name(raw)
+        # v1.43.0: общий разбор `Категория/Имя` | `Документ.X` (`_split_object_arg`); путь с
+        # русским множественным (`Документы/X`) теперь распознаётся так же, как `Documents/X`.
+        wanted_category, bare = _split_object_arg(raw)
         target = bare.lower()
         ext_categories = [cat for cat, obj_name, _rel in (_extension_metadata_xml or ()) if obj_name.lower() == target]
         cats = list(dict.fromkeys([*_resolve_object_categories(bare), *ext_categories]))
@@ -16879,6 +17748,21 @@ def make_bsl_helpers(
         r"(?<!\w)(?:Новый|New)\s+(?:Запрос|Query)\s*\(\s*$",
         re.IGNORECASE,
     )
+    # v1.43.0: текст запроса узнаётся по СОДЕРЖИМОМУ литерала, а не по имени переменной.
+    # Начало — ВЫБРАТЬ/SELECT; тело — хотя бы одно слово ИЗ/FROM/ПОМЕСТИТЬ/INTO/КАК/AS:
+    # без него это фрагмент («ВЫБРАТЬ РАЗРЕШЕННЫЕ» в СтрЗаменить, хвост склейки) — на
+    # корпусе 20 745 модулей признак отсёк все 376 таких литералов.
+    _QUERY_CONTENT_START_RE = re.compile(r"^\s*(?:ВЫБРАТЬ|SELECT)(?!\w)", re.IGNORECASE)
+    _QUERY_CONTENT_BODY_RE = re.compile(r"(?<!\w)(?:ИЗ|FROM|ПОМЕСТИТЬ|INTO|КАК|AS)(?!\w)", re.IGNORECASE)
+    # Начало НЕ прописными («Выбрать из списка», «Select from the list») — так пишутся и тексты
+    # интерфейса, поэтому такой литерал — запрос, только если источник доказан: после ИЗ/FROM
+    # (СОЕДИНЕНИЕ/JOIN) идёт имя с точкой (`Справочник.X`) либо есть ПОМЕСТИТЬ/INTO. Настоящие
+    # запросы с началом не прописными на корпусах есть («Выбрать Ссылка Из Перечисление.X»),
+    # поэтому регистрозависимое начало их потеряло бы.
+    _QUERY_CONTENT_UPPER_START_RE = re.compile(r"^\s*(?:ВЫБРАТЬ|SELECT)(?!\w)")
+    _QUERY_CONTENT_SOURCE_RE = re.compile(
+        r"(?<!\w)(?:(?:ИЗ|FROM|СОЕДИНЕНИЕ|JOIN)\s+\w+\.\w|(?:ПОМЕСТИТЬ|INTO)(?!\w))", re.IGNORECASE
+    )
     _QUERY_TABLE_RE = re.compile(
         r"\b(?:ИЗ|FROM|СОЕДИНЕНИЕ|JOIN)\s+"
         r"((?:РегистрНакопления|РегистрСведений|РегистрБухгалтерии|"
@@ -16976,8 +17860,9 @@ def make_bsl_helpers(
         tokens.append(("code", "".join(code_buf)))
         return tokens, comment_spans
 
-    def _extract_lexed_queries(tokens: list[tuple]) -> list[tuple[int, str]]:
-        """``[(line, query_text)]`` для форм, невидимых построчному скану ветки присваивания:
+    def _extract_lexed_queries(tokens: list[tuple]) -> list[tuple[int, str, int]]:
+        """``[(line, query_text, literal_start_offset)]`` для форм, невидимых построчному скану
+        ветки присваивания (смещение открывающей кавычки — для прохода «по содержимому»):
         конструктор ``Новый Запрос("...")`` / ``New Query("...")`` и присваивание
         ``Запрос.Текст =`` с литералом на СЛЕДУЮЩЕЙ строке.
 
@@ -16997,7 +17882,7 @@ def make_bsl_helpers(
         одна и та же строка попала бы в выдачу дважды. Её целиком (вместе с историческим
         ``text_preview``) обрабатывает legacy-ветка.
         """
-        out: list[tuple[int, str]] = []
+        out: list[tuple[int, str, int]] = []
         for idx, tok in enumerate(tokens):
             if tok[0] != "str":
                 continue
@@ -17016,7 +17901,31 @@ def make_bsl_helpers(
             # line — строка НАЧАЛА выражения (`Новый` / `Запрос.Текст`), а не строки-литерала:
             # они расходятся, когда литерал перенесён на следующую строку.
             expr_line = tok[2] - code_before[m.start() :].count("\n")
-            out.append((expr_line, tok[1]))
+            out.append((expr_line, tok[1], tok[3]))
+        return out
+
+    def _extract_content_queries(tokens: list[tuple], taken: set[int]) -> list[tuple[int, str]]:
+        """Литералы-тексты запросов, которых не взяли формы присваивания и конструктора (v1.43.0).
+
+        Запрос узнаётся по содержимому: переменная с другим именем (``ТекстЗапросаДанных =``),
+        другой объект запроса (``ЗапросПоСкладам.Текст =``), ``Возврат "ВЫБРАТЬ…"``. ``line`` —
+        строка начала литерала. Гард склейки — тот же, что у перенесённой формы и
+        конструктора (v1.30.0): литерал, к которому примыкает ``+`` с любой стороны, — часть
+        выражения, и частичного запроса не выдаём."""
+        out: list[tuple[int, str]] = []
+        for idx, tok in enumerate(tokens):
+            if tok[0] != "str" or tok[3] in taken:
+                continue
+            text = tok[1]
+            if not _QUERY_CONTENT_START_RE.match(text) or not _QUERY_CONTENT_BODY_RE.search(text):
+                continue
+            if not _QUERY_CONTENT_UPPER_START_RE.match(text) and not _QUERY_CONTENT_SOURCE_RE.search(text):
+                continue  # «Выбрать из списка» — текст интерфейса, а не запрос
+            before = tokens[idx - 1][1] if idx and tokens[idx - 1][0] == "code" else ""
+            after = tokens[idx + 1][1] if idx + 1 < len(tokens) and tokens[idx + 1][0] == "code" else ""
+            if before.rstrip().endswith("+") or after.lstrip().startswith("+"):
+                continue
+            out.append((tok[2], text))
         return out
 
     def extract_queries(path: str) -> list[dict]:
@@ -17046,6 +17955,17 @@ def make_bsl_helpers(
 
         У перенесённой формы и у конструкторов ``text_preview`` чистый: лексер отдаёт сам
         литерал, со снятыми continuation-``|``.
+
+        **v1.43.0 — третья форма: запрос узнаётся по СОДЕРЖИМОМУ литерала.** Любой литерал,
+        текст которого начинается с ``ВЫБРАТЬ``/``SELECT`` и содержит отдельным словом
+        ``ИЗ``/``FROM``/``ПОМЕСТИТЬ``/``INTO``/``КАК``/``AS``, — запись, даже если переменная
+        называется иначе (``ТекстЗапросаДанных =``), это другой объект запроса
+        (``ЗапросПоСкладам.Текст =``) или ``Возврат "ВЫБРАТЬ…"``; ``line`` — строка начала
+        литерала. Литерал, к которому примыкает ``+``, записью не становится — у конструктора,
+        перенесённой формы и новой формы; ИСКЛЮЧЕНИЕ, как и до релиза, — однострочное
+        ``Запрос.Текст = "…" + X``/``ТекстЗапроса = "…" + X``: оно извлекается с хвостом строки
+        (совместимость). Фрагменты без источника (``"ВЫБРАТЬ РАЗРЕШЕННЫЕ"`` в ``СтрЗаменить``)
+        записей не дают.
 
         Returns: list of dicts {procedure, line, tables: [str], text_preview}."""
         content = _ext_read_file(path)
@@ -17085,6 +18005,9 @@ def make_bsl_helpers(
             return None
 
         queries: list[dict] = []
+        # v1.43.0: смещения открывающих кавычек литералов, уже давших запись (построчная ветка и
+        # лексерный проход). Третий проход «по содержимому» их не повторяет.
+        taken: set[int] = set()
         i = 0
         while i < len(lines):
             line = lines[i]
@@ -17101,6 +18024,7 @@ def make_bsl_helpers(
                     continue
                 # `m.end()-1` — позиция открывающей кавычки: ею и ограничен сбор продолжений
                 cap = _literal_end_line(line_starts[i] + m.end() - 1)
+                taken.add(line_starts[i] + m.end() - 1)
 
             # Collect multiline query text (1C uses | prefix for continuation)
             query_start = i
@@ -17150,7 +18074,7 @@ def make_bsl_helpers(
         # хвостом строки) — она получила только source-aware отбраковку: совпадения в
         # комментариях и внутри литералов отбрасываются, а сбор продолжений не выходит за
         # конец своего литерала. Для модуля без этих патологий результат прежний байт в байт.
-        for expr_line, query_text in _extract_lexed_queries(tokens):
+        def _lexed_record(expr_line: int, query_text: str) -> dict:
             tables = list(dict.fromkeys(m2.group(1) for m2 in _QUERY_TABLE_RE.finditer(query_text)))
             proc_name = ""
             for p in procs:
@@ -17160,14 +18084,23 @@ def make_bsl_helpers(
             preview = query_text[:200].strip()
             if len(query_text) > 200:
                 preview += "..."
-            queries.append(
-                {
-                    "procedure": proc_name,
-                    "line": expr_line,
-                    "tables": tables,
-                    "text_preview": preview,
-                }
-            )
+            return {
+                "procedure": proc_name,
+                "line": expr_line,
+                "tables": tables,
+                "text_preview": preview,
+            }
+
+        for expr_line, query_text, literal_off in _extract_lexed_queries(tokens):
+            taken.add(literal_off)
+            queries.append(_lexed_record(expr_line, query_text))
+
+        # v1.43.0: третья форма — любой литерал, текст которого начинается с ВЫБРАТЬ/SELECT и
+        # содержит ИЗ/КАК…, если его не взяли формы выше; `line` — строка начала литерала. Только
+        # при `line_starts`: без них гарды отключены, и поведение остаётся прежним.
+        if line_starts:
+            for literal_line, query_text in _extract_content_queries(tokens, taken):
+                queries.append(_lexed_record(literal_line, query_text))
 
         # Порядок — по источнику. Сортировка стабильная, поэтому при совпадении строк
         # присваивания идут перед конструкторами, а внутри каждой группы порядок обхода
@@ -17295,8 +18228,10 @@ def make_bsl_helpers(
         object_name — имя объекта для прицельного поиска ('' = все)."""
         from rlm_tools_bsl.extension_detector import find_extension_overrides as _feo
 
+        # v1.43.0: `Справочник.X`/`Catalogs/X` — объект в категории (раньше молчаливый ноль).
+        want_cat, bare = _split_object_arg(object_name)
         diagnostics: dict = {}
-        overrides = _feo(extension_path, object_name or None, diagnostics=diagnostics)
+        overrides = _feo(extension_path, bare or None, diagnostics=diagnostics)
         # v1.41.0: несуществующий корень — названный отказ, а не total=0 с partial=True:
         # туда по памяти кладут имя объекта или `../`-путь из extension_file, и тихий ноль
         # читался как «перехватов нет». Нечитаемые файлы существующего корня — прежний partial.
@@ -17321,6 +18256,13 @@ def make_bsl_helpers(
             ext_name = ""
         if not ext_name:
             ext_name = _extension_name_for_root(extension_path) or ""
+        # Категория судится по пути модуля в расширении, поэтому корень нужен строке ДО
+        # фильтра (тот же переданный корень проставит и нормализатор ниже). Без категории
+        # строки не трогаются — выход голого имени байт-в-байт прежний.
+        if want_cat:
+            for r in overrides:
+                r.setdefault("extension_root", extension_path)
+            overrides = _filter_overrides_by_category(overrides, want_cat)
         # Срез берётся ПЕРВЫМ, в прежнем порядке обхода (os.walk), и только потом строки
         # нормализуются — на копиях. Ввести здесь свою сортировку означало бы поменять
         # СОСТАВ первых 200 строк на конфигурациях с total>200; детерминизм этого среза
@@ -17413,6 +18355,31 @@ def make_bsl_helpers(
             return f"{rel}/{tail}" if rel else tail
         return ""
 
+    def _override_row_identity(row: dict) -> tuple[str, ...]:
+        """Идентичность перехваченного модуля по пути модуля В РАСШИРЕНИИ (``_canonical_module_key``).
+
+        Путь модуля расширения повторяет путь модуля основной конфигурации с точностью до
+        раскладки выгрузки, поэтому идентичность верна и там, где сборщик не связал строку с
+        модулем основной конфигурации (``source_path`` пуст), и там, где связал с чужим
+        (при промахе пути — по имени объекта и типу модуля без категории и формы)."""
+        return _canonical_module_key(str(row.get("ext_module_path") or row.get("module_path") or ""))
+
+    def _override_row_category(row: dict) -> str:
+        """Категория перехваченного модуля (нижний регистр) по пути модуля в расширении."""
+        rel = str(row.get("ext_module_path") or row.get("module_path") or "")
+        root = str(row.get("extension_root") or "")
+        if not rel or not root:
+            return ""
+        info = parse_bsl_path(os.path.join(root, rel), root)
+        return _normalize_category(info.category) if info.category else ""
+
+    def _filter_overrides_by_category(rows: list[dict], category: str) -> list[dict]:
+        """Строки перехватов модулей объекта категории ``category`` (пусто — все строки)."""
+        if not category:
+            return rows
+        want = _normalize_category(category)
+        return [r for r in rows if _override_row_category(r) == want]
+
     def _normalize_override_row(row: dict, extension_name: str = "", extension_root: str = "") -> dict:
         """Единый ADDITIVE shape строки перехвата для index / live / find_ext веток.
 
@@ -17458,6 +18425,18 @@ def make_bsl_helpers(
                 out[key] = ""
         for key in _OVERRIDE_OPT_KEYS:
             out.setdefault(key, None)
+        # v1.43.0: привязка индексной строки к модулю основной конфигурации сверяется с
+        # идентичностью по пути модуля В РАСШИРЕНИИ. Сборщик при промахе пути привязывает
+        # строку к модулю одноимённого объекта другой категории/формы; такая привязка не
+        # доказана — `source_path=""`, `target_method_line=None` (документированное значение
+        # «строка без source-привязки»). Строку, у которой идентичность не вычисляется,
+        # не судим.
+        if out["source_path"]:
+            ident = _override_row_identity(out)
+            if _identity_is_proven(ident) and ident != _module_identity(out["source_path"]):
+                out["source_path"] = ""
+                out["source_module_id"] = None
+                out["target_method_line"] = None
         out["extension_file"] = _override_extension_file(out)
         return out
 
@@ -17655,10 +18634,16 @@ def make_bsl_helpers(
         _warn_bound(_wl)
         offset, _wo = _coerce_bound(offset, 0, "offset", "get_overrides(..., limit=200, offset=0)")
         _warn_bound(_wo)
+        # v1.43.0: `Документ.X`/`Documents/X` — объект В КАТЕГОРИИ. Фильтр имени уходит в
+        # источник голым именем (ридер и живой обход сравнивают его как есть), категория —
+        # по пути перехваченного модуля в расширении (`_override_row_category`). Раньше
+        # типизированное имя давало молчаливый ноль.
+        want_cat, bare = _split_object_arg(object_name)
         # Try index first
         if idx_reader is not None:
-            result = idx_reader.get_extension_overrides(object_name, method_name)
+            result = idx_reader.get_extension_overrides(bare, method_name)
             if result is not None:
+                result = _filter_overrides_by_category(result, want_cat)
                 return _overrides_payload(result, source="index", limit=limit, offset=offset)
         # Live fallback
         from rlm_tools_bsl.extension_detector import (
@@ -17695,7 +18680,7 @@ def make_bsl_helpers(
             nonlocal successful_scans
             diagnostics: dict = {}
             try:
-                rows = _feo(extension_path, object_name or None, diagnostics=diagnostics)
+                rows = _feo(extension_path, bare or None, diagnostics=diagnostics)
             except Exception as exc:
                 failed_extension_roots.append(
                     {
@@ -17756,6 +18741,8 @@ def make_bsl_helpers(
                     ov["extension_root"] = ext.path
                 all_overrides.extend(ovs)
 
+        # Категория — после трёх веток роли: только там строки получают extension_root.
+        all_overrides = _filter_overrides_by_category(all_overrides, want_cat)
         if method_name:
             all_overrides = [ov for ov in all_overrides if ov.get("target_method", "").lower() == method_name.lower()]
 
@@ -19557,7 +20544,7 @@ def make_bsl_helpers(
     _reg(
         "count_matches",
         count_matches,
-        "count_matches(pattern, file_types='bsl', path='', regex=False, ignore_case=False, top=20, "
+        "count_matches(pattern, file_types='bsl', path='', regex=False, ignore_case=True, top=20, "
         "group_by='category') -> {files_matched, occurrences, top:[dict], groups:[dict], truncated, "
         "source, extensions_included, ...}"
         "  # АГРЕГАТ вместо тел; там, где grep отказывает (>5000)",
@@ -19580,6 +20567,11 @@ def make_bsl_helpers(
         "  #   два совпадения в одной строке дают ОДНО. Так обе внутренние ветки\n"
         "  #   (git и Python) дают одинаковые числа на литеральном паттерне.\n"
         "  # regex=True — Python-regex; по умолчанию pattern ЛИТЕРАЛЬНЫЙ.\n"
+        "  # По умолчанию регистр НЕ учитывается (1С регистронезависима);\n"
+        "  #   ignore_case=False — точное написание.\n"
+        "  # file_types — не только bsl: 'rights', 'form', 'dcs' перечисляются обходом файлов.\n"
+        "  # source: index | live | index+live (смешанный набор расширений файлов или\n"
+        "  #   соседние расширения — их модули перечисляются живьем).\n"
         "  # path — ОТНОСИТЕЛЬНОЕ поддерево ('CommonModules'); абсолютный путь,\n"
         "  #   ведущий разделитель, '..' и glob-метасимволы отклоняются ValueError.\n"
         "  # ОХВАТ читается ДВУМЯ осями: source (откуда данные) и\n"
@@ -19732,6 +20724,10 @@ def make_bsl_helpers(
         "  # Если расширения перехватили метод — читать с перехватами:\n"
         "  full = read_procedure(path, 'ProcName', include_overrides=True)\n"
         "  # full = оригинал + '=== Перехвачен &Аннотация в расширении X ===' + тело перехвата\n"
+        "  # Метода в базовом модуле нет, а перехват есть (событие платформы без обработчика):\n"
+        "  #   full = строка-пометка '// Метод X в базовом модуле не объявлен...' + секции перехватов.\n"
+        "  #   У общего модуля событий платформы нет: там это расхождение версий основной и расширения.\n"
+        "  #   Без индекса перехваты берутся живым обходом расширений.\n"
         "  # BATCH: несколько методов одного модуля одним вызовом (модуль парсится ОДИН раз;\n"
         "  #   упавший элемент изолирован своим {error} и батч не рушит) → dict по имени:\n"
         "  bodies = read_procedure(path, ['ОбработкаПроведения', 'ПриЗаписи'])  # {name: str|None|{error}}\n"
@@ -19969,10 +20965,10 @@ def make_bsl_helpers(
     _reg(
         "find_definition",
         find_definition,
-        "find_definition(name, module_hint='', limit=50) -> {name, definitions:[{file, line, end_line, type, "
-        "is_export, params, category, object_name, module_type, owner}], total, truncated, partial, "
+        "find_definition(name(str|list), module_hint='', limit=50) -> {name, definitions:[{file, line, end_line, "
+        "type, is_export, params, category, object_name, module_type, owner}], total, truncated, partial, "
         "_meta:{index_used, unique, slow_fallback, source, extensions_included, total_exact, ...}}  "
-        "# hint по объекту — ТОЧНОЕ имя",
+        "# list → {имя: ответ}; hint по объекту — ТОЧНОЕ имя",
         "code",
         [
             "definition",
@@ -20509,8 +21505,10 @@ def make_bsl_helpers(
         "  # Default — весь список (контракт прежний):\n"
         "  subs = find_event_subscriptions('АвансовыйОтчет')\n"
         "  for s in subs: print(s['event'], s['handler'])\n"
-        "  # С фильтром по событию (case-insensitive substring) — list[str] ИЛИ одна строка:\n"
-        "  before_write = find_event_subscriptions('АвансовыйОтчет', event_filter=['BeforeWrite','ПередЗаписью'])\n"
+        "  # С фильтром по событию (case-insensitive substring) — list[str] ИЛИ одна строка.\n"
+        "  # Имя события — английское, как в XML подписки (BeforeWrite, OnWrite, Posting, Filling):\n"
+        "  # русское имя обработчика ('ПередЗаписью') не совпадает никогда.\n"
+        "  write_events = find_event_subscriptions('АвансовыйОтчет', event_filter=['BeforeWrite','OnWrite'])\n"
         "  before_write_one = find_event_subscriptions('АвансовыйОтчет', event_filter='BeforeWrite')  # ок: одна строка\n"
         "  # С пагинацией (формат меняется на dict!):\n"
         "  page = find_event_subscriptions('', limit=50)\n"
@@ -20545,6 +21543,8 @@ def make_bsl_helpers(
         "  #   declared_registers — ОБЪЯВЛЕНО в метаданных (<RegisterRecords> / <registerRecords>),\n"
         "  #     список канонических ссылок (AccumulationRegister.X), СТРАНИЦЕЙ до 40:\n"
         "  #     declared_total — полное число, declared_truncated — признак усечения.\n"
+        "  #     declared_by_kind — ПОЛНЫЙ состав по видам ({AccumulationRegister: N, ...}) всегда;\n"
+        "  #     при усечении _meta.declared_route — маршрут к полному списку.\n"
         "  # На боевой Реализации: выведено 35, объявлено 54, пересечение 16 — то есть\n"
         "  #   новое поле НЕ заменяет старое и не сливается с ним.\n"
         "  # undeclared_code_registers — выведенные из кода имена, МЕТАДАННЫМИ НЕ ОБЪЯВЛЕННЫЕ.\n"
@@ -20564,7 +21564,11 @@ def make_bsl_helpers(
         "  # partial=True означает неполное чтение CFE: _meta.modules_scanned содержит только\n"
         "  #   успешно прочитанные модули. При пустом code_registers смотри posting_handler_present + hint.\n"
         "  # source у строки code_registers:\n"
-        "  #   'code'         — прямое Движения.X в ObjectModule документа;\n"
+        "  #   'code'         — прямое Движения.X в ObjectModule документа либо делегат\n"
+        '  #     «регистр по имени» (ПроведениеСервер.ОтразитьДвиженияПоРегистру(..., "Имя"));\n'
+        "  #     имя через переменную у такого делегата — строка unresolved (dynamic_name);\n"
+        "  #     в модулях расширений unresolved дает только такой делегат (индексаторную форму\n"
+        "  #     Движения[Имя] там не видно);\n"
         "  #   'manager_code' — запись набора из МОДУЛЯ МЕНЕДЖЕРА документа\n"
         "  #     (Регистры<Тип>.X.СоздатьНаборЗаписей()), имя сверено с каталогом регистров.\n"
         "  #     Фреймворковые схемы, где имя регистра собирается в структуре во время\n"
@@ -20670,8 +21674,13 @@ def make_bsl_helpers(
         "  #   добавил помощник другого модуля (p['delegate']); not_set — представление\n"
         "  #   в модуле не задано.\n"
         "  # presentation=None — «не литерал в этом модуле», а НЕ пустое представление.\n"
-        "  # _meta.delegates — модули, которым передан ВЕСЬ список команд: хелпер туда\n"
-        "  #   не ходит, их команды ищи find_print_forms/read_procedure по этим модулям.",
+        "  # _meta.delegates — вызовы, которым передан ВЕСЬ список команд; хелпер их РАСКРЫВАЕТ\n"
+        "  #   (до 3 переходов, тот же список, точный модуль получателя): строки делегата идут\n"
+        "  #   после своих, file — модуль делегата, команда с тем же name — первое вхождение.\n"
+        "  # Что не раскрыто и почему — _meta.delegates_expanded[i].status: expanded | other_list\n"
+        "  #   | module_not_found | procedure_not_found | cycle | depth_limit | unsupported_receiver\n"
+        "  #   (ключ есть, только когда делегаты есть).\n"
+        "  # Имя — ТОЧНЫЙ объект ('Документ.X' сужает категорию); фрагмент — подстрочный поиск.",
     )
     _reg(
         "find_functional_options",
@@ -20757,7 +21766,13 @@ def make_bsl_helpers(
         "  queries = extract_queries('path/to/ObjectModule.bsl')\n"
         "  for q in queries:\n"
         "      print(f\"  {q['procedure']} стр.{q['line']}: таблицы={q['tables']}\")\n"
-        "      print(f\"    {q['text_preview'][:100]}\")",
+        "      print(f\"    {q['text_preview'][:100]}\")\n"
+        '  # Формы: Запрос.Текст = / ТекстЗапроса = (и с литералом строкой ниже), Новый Запрос("..."),\n'
+        "  #   и ТРЕТЬЯ — любой литерал, который начинается с ВЫБРАТЬ/SELECT и содержит ИЗ/КАК...\n"
+        '  #   (переменная с другим именем, другой объект запроса, Возврат "ВЫБРАТЬ...");\n'
+        "  #   у нее line — строка начала литерала.\n"
+        "  # Литерал, к которому примыкает '+', записью не становится (частичного запроса нет);\n"
+        '  #   ИСКЛЮЧЕНИЕ (совместимость) — однострочное Запрос.Текст = "..." + X: с хвостом строки.',
     )
     _reg(
         "code_metrics",
@@ -21127,9 +22142,10 @@ def make_bsl_helpers(
         "  # has_more = «есть следующая страница»; truncated = «список неполон относительно\n"
         "  # total» (на последней странице has_more=False, а truncated по-прежнему True).\n"
         "  # Агрегаты от offset НЕ зависят — они всегда по полному набору.\n"
-        "  # target_method_line=None — ВАЛИДНОЕ значение, не ошибка индекса: так выглядит\n"
-        "  # перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения\n"
-        "  # и т.п.), у которого в базовом модуле нет текстового объявления, а также\n"
+        "  # target_method_line=None — ВАЛИДНОЕ значение, не ошибка индекса: метода нет в\n"
+        "  # базовом модуле — обычно перехват события платформы (ПриЗаписи, ОбработкаПроведения\n"
+        "  # и т.п.) без обработчика в основной конфигурации; у общего модуля событий платформы\n"
+        "  # нет — там это расхождение версий основной конфигурации и расширения. Либо это\n"
         "  # строка без source-привязки.\n"
         "  # ПУТЬ ДО ФАЙЛА расширения — ОДИН ключ, и он ИСПОЛНИМ в этой же сессии (v1.37.0):\n"
         "  #   body = read_procedure(ov['extension_file'], ov['extension_method'])\n"

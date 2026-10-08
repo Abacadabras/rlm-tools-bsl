@@ -11701,6 +11701,21 @@ def _can_index_glob(pattern: str) -> tuple[str, dict] | None:
     return None
 
 
+def _glob_explicit_extension(kind: str, params: dict) -> str | None:
+    """Явный суффикс маски (``.rights``) либо ``None``, если маска расширения не называет.
+
+    v1.43.0: навигационный индекс хранит только ``_FILE_NAV_EXTENSIONS``; маска с ДРУГИМ явным
+    расширением отвечала бы из него ложным нулём, поэтому ридер отдаёт для неё ``None``.
+    """
+    if kind in ("by_extension", "prefix_recursive_ext", "under_prefix_ext"):
+        return params["ext"]
+    if kind in ("dir_file", "name_exact", "exact"):
+        name = str(params.get("file") or params.get("filename") or params.get("path") or "").rsplit("/", 1)[-1]
+        dot = name.rfind(".")
+        return name[dot:] if dot > 0 else None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Defensive reader (v1.26.0, Finding #1): transient-safe wrapper + zero-stats
 # ---------------------------------------------------------------------------
@@ -13545,6 +13560,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return False
 
+    @_transient_safe(lambda: None)
     def glob_files(self, pattern: str) -> list[str] | None:
         """Resolve a glob pattern from the index.
 
@@ -13555,6 +13571,11 @@ class IndexReader:
         if strategy is None:
             return None
         kind, params = strategy
+        explicit = _glob_explicit_extension(kind, params)
+        if explicit is not None and explicit.lower() not in _FILE_NAV_EXTENSIONS:
+            # Таких файлов в навигационном индексе нет ПО ПОСТРОЕНИЮ: [] был бы ложным
+            # нулём. None — честный ответ файловой системы (вызывающий идёт в pathlib.glob).
+            return None
         with self._lock:
             try:
                 if kind == "by_extension":
