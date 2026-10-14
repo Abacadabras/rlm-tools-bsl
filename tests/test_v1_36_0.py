@@ -1127,6 +1127,11 @@ def test_reader_fixtures_smoke(request, fixture_name):
 #            После приемки: find_unresolved_calls +32 (expression/kind/target_owner в issues),
 #            search_module_headers +11 (with_text) — внутри запаса, порог НЕ двигается:
 #            факт 12 591 при пороге 12 648 (прежние хелперы 12 304 при 12 393).
+#   v1.44.0: search_module_headers +18 (header_truncated в строке выдачи) −22 (отсылка
+#            «как у search_regions» переехала в рецепт); find_register_movements +16
+#            (declared_total/declared_truncated названы полностью: суффиксная форма
+#            читалась как declared_registers_total) −8 («стр.1» про _meta.delegates
+#            переехало в рецепт) — порог НЕ двигается: факт 12 625 при пороге 12 648.
 _SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557 + 255
 
 
