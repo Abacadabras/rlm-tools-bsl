@@ -24,6 +24,7 @@ from rlm_tools_bsl.bsl_index import (
     _collect_object_synonyms,
     _git_available,
     _git_changed_files,
+    _git_commit_exists,
     _git_current_dirty,
     _git_dirty_timeout,
     _git_head_sha,
@@ -95,7 +96,7 @@ def _read_meta(db_path: Path, key: str) -> str | None:
 def _install_worktree_timeout(monkeypatch) -> None:
     """Force best-effort work-tree git commands to time out.
 
-    Critical commands (rev-parse, merge-base, committed diff) pass through so
+    Critical commands (rev-parse, cat-file, committed diff) pass through so
     the fast path is still *attempted* — only the staged/unstaged/untracked
     work-tree probes (which carry ``--ignore-cr-at-eol`` or ``ls-files
     --others``) raise ``TimeoutExpired``, marking detection unreliable.
@@ -104,7 +105,7 @@ def _install_worktree_timeout(monkeypatch) -> None:
     # на Windows реальный runner вообще не ходит через ``subprocess.run`` (у него
     # свой CreateProcessW-путь), а seam ``_git_process._run_posix`` захвачен на
     # импорте. Делегат сохраняется ДО подмены, поэтому критические команды
-    # (rev-parse / merge-base / committed diff) выполняются по-настоящему.
+    # (rev-parse / cat-file / committed diff) выполняются по-настоящему.
     real_run_git = bsl_index_mod.run_git
 
     def fake_run_git(args, *, timeout):
@@ -233,6 +234,27 @@ class TestGitHeadSha:
         assert all(c in "0123456789abcdef" for c in sha)
 
 
+class TestGitCommitExists:
+    def test_head_exists(self, git_bsl_project):
+        sha = _git_head_sha(str(git_bsl_project))
+        assert _git_commit_exists(str(git_bsl_project), sha) is True
+
+    def test_unknown_sha(self, git_bsl_project):
+        assert _git_commit_exists(str(git_bsl_project), "0" * 40) is False
+
+    def test_rewritten_commit_still_exists(self, git_bsl_project):
+        """Переписанный amend/rebase коммит остаётся объектом репозитория (его держит reflog)."""
+        root = git_bsl_project.parent
+        old_sha = _git_head_sha(str(git_bsl_project))
+        _git(root, "commit", "--amend", "-m", "rewritten")
+        assert _git_head_sha(str(git_bsl_project)) != old_sha
+        assert _git(root, "merge-base", "--is-ancestor", old_sha, "HEAD", check=False).returncode != 0
+        assert _git_commit_exists(str(git_bsl_project), old_sha) is True
+
+    def test_no_git(self, tmp_path):
+        assert _git_commit_exists(str(tmp_path), "0" * 40) is False
+
+
 class TestGitChangedFiles:
     def test_committed(self, git_bsl_project):
         root = git_bsl_project.parent
@@ -309,6 +331,43 @@ class TestGitChangedFiles:
         _, prefix = info
         result = _git_changed_files(str(git_bsl_project), "0" * 40, prefix)
         assert result is None
+
+    def test_since_commit_rewritten_by_amend(self, git_bsl_project):
+        """Сохранённый коммит переписан (rebase/amend): не предок HEAD, но дельта считается."""
+        root = git_bsl_project.parent
+        old_sha = _git_head_sha(str(git_bsl_project))
+
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "add", ".")
+        _git(root, "commit", "--amend", "--no-edit")
+        assert _git(root, "merge-base", "--is-ancestor", old_sha, "HEAD", check=False).returncode != 0
+
+        info = _git_repo_info(str(git_bsl_project))
+        _, prefix = info
+        changed = _git_changed_files(str(git_bsl_project), old_sha, prefix)
+        assert changed is not None
+        assert changed.unreliable_reason is None
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
+
+    def test_since_commit_on_unmerged_branch(self, git_bsl_project):
+        """Сохранённый коммит лежит на другой, несмерженной ветке: tree-diff видит разницу с HEAD."""
+        root = git_bsl_project.parent
+        _git(root, "checkout", "-q", "-b", "feature")
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "feature change")
+        feature_sha = _git_head_sha(str(git_bsl_project))
+        _git(root, "checkout", "-q", "-")
+        assert _git(root, "merge-base", "--is-ancestor", feature_sha, "HEAD", check=False).returncode != 0
+
+        info = _git_repo_info(str(git_bsl_project))
+        _, prefix = info
+        changed = _git_changed_files(str(git_bsl_project), feature_sha, prefix)
+        assert changed is not None
+        assert changed.unreliable_reason is None
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
 
     def test_prefix_filter(self, git_bsl_project):
         root = git_bsl_project.parent
@@ -500,6 +559,24 @@ class TestUpdateGitFastPath:
         result = IndexBuilder().update(str(git_bsl_project))
         new_count = int(_read_meta(db_path, "bsl_count"))
         assert new_count == old_count + result["added"] - result["removed"]
+
+    def test_rewritten_head_keeps_fast_path(self, git_bsl_project):
+        """Индекс собран на коммите, который потом переписан (rebase/amend) — fast path сохраняется."""
+        root = git_bsl_project.parent
+        db_path = get_index_db_path(str(git_bsl_project))
+        stored_before = _read_meta(db_path, "git_head_commit")
+
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        _git(root, "add", ".")
+        _git(root, "commit", "--amend", "--no-edit")
+        assert _git(root, "merge-base", "--is-ancestor", stored_before, "HEAD", check=False).returncode != 0
+
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is True
+        assert result["git_fallback_reason"] is None
+        assert result["changed"] == 1
+        assert _read_meta(db_path, "git_head_commit") == _git_head_sha(str(git_bsl_project))
 
 
 class TestUpdateFallback:
@@ -794,6 +871,23 @@ class TestFallbackReasonInDelta:
         result = IndexBuilder().update(str(git_bsl_project))
         assert result["git_fast_path"] is True
         assert result["git_fallback_reason"] is None
+
+    def test_stored_commit_missing_reason(self, git_bsl_project):
+        """Объекта сохранённого коммита нет в репозитории → полный скан с точной причиной, не `git error`."""
+        db_path = get_index_db_path(str(git_bsl_project))
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE index_meta SET value = ? WHERE key = 'git_head_commit'", ("0" * 40,))
+        conn.commit()
+        conn.close()
+
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is False
+        assert result["git_fallback_reason"] == "stored commit missing"
+
+        # Текущий HEAD сохранён — следующий update снова идёт быстрым путём.
+        assert _read_meta(db_path, "git_head_commit") == _git_head_sha(str(git_bsl_project))
+        result2 = IndexBuilder().update(str(git_bsl_project))
+        assert result2["git_fast_path"] is True
 
 
 class TestCollectMetadataTablesKwargs:
