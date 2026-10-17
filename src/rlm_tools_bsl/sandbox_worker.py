@@ -765,6 +765,7 @@ def _build_session(
         format_info=format_info,
         idx_reader=idx_reader,
         idx_zero_callers_authoritative=bool(payload.get("idx_zero_callers_authoritative")),
+        index_start_status=payload.get("index_start_status"),
         extension_paths=worker_extension_paths,
         output_capture_factory=lambda: writer,
         # Отсутствие ключа = прежнее поведение (BSL-хелперы включены).

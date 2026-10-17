@@ -1579,6 +1579,8 @@ def test_get_overrides_root_key_set_is_pinned(overrides_session):
         "unique_methods",
         "unique_object_methods",
         "unique_extensions",
+        # v1.45.0 (Д11): прежде набора без этого ключа — модули уровня конфигурации считаются отдельно
+        "config_level_overrides",
     }, sorted(bsl["get_overrides"]())
 
 

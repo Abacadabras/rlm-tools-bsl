@@ -1989,7 +1989,8 @@ class TestCodeUsagesKindOnLiveRoute:
 
     def test_live_route_without_kind_is_not_flagged(self, cf):
         res = _make_bsl(cf, private_io=True)["find_code_usages"]("Документ.ТестДок")
-        assert res["_meta"]["kind_filter_applied"] is True, res["_meta"]
+        # v1.45.0: прежде здесь стояло `is True`; фильтр не запрошен — None (на обоих маршрутах)
+        assert res["_meta"]["kind_filter_applied"] is None, res["_meta"]
 
     def test_index_route_applies_the_filter(self, cf):
         class _R(_DummyReader):

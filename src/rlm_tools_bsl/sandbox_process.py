@@ -282,6 +282,8 @@ class ProcessBackendConfig:
     db_path: str | None = None
     index_expected: bool = False
     idx_zero_callers_authoritative: bool = False
+    # v1.45.0 (Д29): метка свежести и итог выборки старта — {index_status, content_sample} или None
+    index_start_status: dict | None = None
     extension_paths: list[str] = field(default_factory=list)
     # Generic-режим (v1.32.0): False отключает загрузку BSL-хелперов в worker.
     # Default True — прежнее поведение для всех существующих конструкций.
@@ -863,6 +865,7 @@ class ProcessSandboxBackend:
                 "db_path": cfg.db_path,
                 "index_expected": cfg.index_expected,
                 "idx_zero_callers_authoritative": cfg.idx_zero_callers_authoritative,
+                "index_start_status": cfg.index_start_status,
                 "extension_paths": list(cfg.extension_paths),
                 "enable_bsl_helpers": cfg.enable_bsl_helpers,
                 "execution_timeout_seconds": 0,

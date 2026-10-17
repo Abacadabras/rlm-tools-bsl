@@ -8413,7 +8413,12 @@ def test_event_subscription_dotless_typed_prefix_is_the_empty_overview(with_inde
             with_index=with_index,
         )
         try:
+            # v1.45.0 (Д8): прежде здесь стояло — префикс без имени отдаёт полный обзор (все подписки). Теперь это
+            # отказ публичной границы с именем хелпера; обзор — пустая строка (и строка из пробелов).
             for object_name in ("Документ.", "документ.", "Document.", "DOCUMENT."):
+                with pytest.raises(ValueError, match="^find_event_subscriptions:"):
+                    bsl["find_event_subscriptions"](object_name)
+            for object_name in ("", "   "):
                 rows = bsl["find_event_subscriptions"](object_name)
                 assert {row["name"] for row in rows} == {"ПодпискаДок", "ПодпискаСпр", "ПодпискаОбщая"}
                 assert all("scope" not in row and "source_types" not in row for row in rows)
