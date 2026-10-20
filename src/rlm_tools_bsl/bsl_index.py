@@ -1949,24 +1949,34 @@ def _git_head_sha(base_path: str) -> str | None:
         return None
 
 
-def _git_commit_exists(base_path: str, sha: str) -> bool:
-    """Return ``True`` when *sha* resolves to a commit object of the repository.
+def _git_commit_exists(base_path: str, sha: str) -> bool | None:
+    """Check that *sha* resolves to a commit object of the repository.
 
     Existence is all the git fast path needs from the stored commit: the
     committed diff (``git diff <sha> HEAD``) compares two trees and does not
     require *sha* to be an ancestor of HEAD. A commit rewritten by rebase /
     amend / force-push stays in the object store while the reflog keeps it
-    (``gc.reflogExpireUnreachable``, 30 days by default), so only a pruned
-    object — or an index copied from another clone — yields ``False``.
+    (``gc.reflogExpireUnreachable``, 30 days by default).
+
+    Returns ``True`` — the commit exists; ``False`` — git confirmed there is no
+    such commit (``rev-parse -q --verify`` exit code 1: the object was pruned,
+    the index was copied from another clone, a shallow history does not contain
+    it); ``None`` — the check itself failed (git not found, timeout, ``OSError``,
+    any other exit code, e.g. a corrupt object). The decision is made on the exit
+    code only, so it does not depend on the language of git messages.
     """
     cmd = _git_base_cmd(base_path)
     if cmd is None:
-        return False
+        return None
     try:
-        r = run_git([*cmd, "cat-file", "-e", f"{sha}^{{commit}}"], timeout=10)
-        return r.returncode == 0
+        r = run_git([*cmd, "rev-parse", "-q", "--verify", f"{sha}^{{commit}}"], timeout=10)
     except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1:
         return False
+    return None
 
 
 def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDirtyResult | None:
@@ -10084,13 +10094,13 @@ class IndexBuilder:
                     git_head = _git_head_sha(base_path)
                     # The stored commit only has to EXIST — ancestry is not required
                     # (tree diff, see _git_changed_files). A rebased / amended /
-                    # force-pushed stored commit therefore keeps the fast path; only a
-                    # pruned object (or an index copied from another clone) has
-                    # nothing to diff against.
+                    # force-pushed stored commit therefore keeps the fast path. Only a
+                    # commit git confirms as absent is "stored commit missing"; a failed
+                    # check (None: timeout, corrupt object, ...) stays "git error".
                     stored_commit_exists = _git_commit_exists(base_path, stored_commit)
                     git_result = _git_changed_files(base_path, stored_commit, prefix) if stored_commit_exists else None
 
-                    if not stored_commit_exists:
+                    if stored_commit_exists is False:
                         fallback_reason = "stored commit missing"
                     elif git_result is None or git_head is None:
                         fallback_reason = "git error" if git_result is None else "head sha error"
